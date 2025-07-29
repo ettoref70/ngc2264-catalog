@@ -31,7 +31,11 @@ try:
     from astroquery.gaia import Gaia
     from astroquery.vizier import Vizier
     from astroquery.irsa import Irsa
-    from astroquery.heasarc import Heasarc
+    # Note: HEASARC queries were used in earlier versions of this script to
+    # obtain Chandra and XMM‑Newton sources. In order to incorporate the
+    # updated X‑ray catalogues from Flaccomio et al. (2023), we now query
+    # the relevant tables in VizieR (J/A+A/670/A37/tablea1 and table2) via
+    # astroquery.vizier. The HEASARC import is therefore no longer needed.
     from astropy.coordinates import SkyCoord
     import astropy.units as u
     import pandas as pd
@@ -100,30 +104,45 @@ def query_wise(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
 
 
 def query_chandra(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
-    """Query HEASARC for Chandra sources.
+    """Query the Flaccomio et al. (2023) Chandra source list via VizieR.
 
-    Returns a DataFrame with positions and IDs.
+    The catalogue `J/A+A/670/A37/tablea1` contains 1043 Chandra/ACIS
+    detections in the NGC 2264 field with positions in columns RAJ2000 and
+    DEJ2000 and a source identifier in the `ACIS` column【355715869545438†L106-L112】.  This function
+    performs a cone search on that table around ``center`` with search
+    ``radius`` and returns a DataFrame of decimal‑degree coordinates along
+    with the ACIS identifier.  If no sources are found, an empty DataFrame
+    with the expected columns is returned.
     """
-    heas = Heasarc()
-    # The mission name 'chanmaster' queries the Chandra Master Source catalogue.
-    table = heas.query_region(center, radius, mission='chanmaster')
-    if table is None or len(table) == 0:
-        return pd.DataFrame(columns=['ra_deg', 'dec_deg', 'chan_name'])
-    df = table.to_pandas()
-    return df.rename(columns={'RA': 'ra_deg', 'DEC': 'dec_deg', 'NAME': 'chan_name'})
+    v = Vizier(columns=['RAJ2000', 'DEJ2000', 'ACIS'], catalog='J/A+A/670/A37/tablea1', row_limit=-1)
+    tables = v.query_region(center, radius=radius)
+    if len(tables) == 0:
+        return pd.DataFrame(columns=['ra_deg', 'dec_deg', 'chandra_id'])
+    tab = tables[0]
+    df = tab.to_pandas()
+    # Rename columns to uniform names used in matching routines
+    df = df.rename(columns={'RAJ2000': 'ra_deg', 'DEJ2000': 'dec_deg', 'ACIS': 'chandra_id'})
+    return df[['ra_deg', 'dec_deg', 'chandra_id']]
 
 
 def query_xmm(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
-    """Query HEASARC for XMM‑Newton sources.
+    """Query the Flaccomio et al. (2023) XMM‑Newton source list via VizieR.
 
-    Returns a DataFrame with positions and IDs.
+    The catalogue `J/A+A/670/A37/table2` provides 944 XMM‑Newton detections
+    with positions in columns RAJ2000 and DEJ2000 and a source
+    identification number in the `XMM` column【583771511037106†L107-L120】.  This function
+    uses astroquery.vizier to perform a cone search and returns the
+    results with uniform column names.  If the query yields no sources,
+    an empty DataFrame with the expected columns is returned.
     """
-    heas = Heasarc()
-    table = heas.query_region(center, radius, mission='xmmssc')  # XMM SSC catalogue
-    if table is None or len(table) == 0:
-        return pd.DataFrame(columns=['ra_deg', 'dec_deg', 'xmm_name'])
-    df = table.to_pandas()
-    return df.rename(columns={'RA': 'ra_deg', 'DEC': 'dec_deg', 'NAME': 'xmm_name'})
+    v = Vizier(columns=['RAJ2000', 'DEJ2000', 'XMM'], catalog='J/A+A/670/A37/table2', row_limit=-1)
+    tables = v.query_region(center, radius=radius)
+    if len(tables) == 0:
+        return pd.DataFrame(columns=['ra_deg', 'dec_deg', 'xmm_id'])
+    tab = tables[0]
+    df = tab.to_pandas()
+    df = df.rename(columns={'RAJ2000': 'ra_deg', 'DEJ2000': 'dec_deg', 'XMM': 'xmm_id'})
+    return df[['ra_deg', 'dec_deg', 'xmm_id']]
 
 
 def cross_match(source_df: pd.DataFrame,
@@ -217,12 +236,17 @@ def main() -> None:
 
     # Cross‑match with Chandra (5 arcsec radius)
     print("Matching Chandra with Gaia ...")
-    chandra_matches = cross_match(out_df, chan, 'chan_name', 5.0 * u.arcsec)
+    # The column name in the Chandra table is now 'chandra_id' as returned by
+    # query_chandra().  Ensure the identifier is correctly propagated into the
+    # output table.
+    chandra_matches = cross_match(out_df, chan, 'chandra_id', 5.0 * u.arcsec)
     out_df['chandra_id'] = [",".join(ids) if ids else None for ids in chandra_matches]
 
     # Cross‑match with XMM‑Newton (5 arcsec radius)
     print("Matching XMM‑Newton with Gaia ...")
-    xmm_matches = cross_match(out_df, xmm, 'xmm_name', 5.0 * u.arcsec)
+    # The column name in the XMM table is now 'xmm_id' as returned by
+    # query_xmm().
+    xmm_matches = cross_match(out_df, xmm, 'xmm_id', 5.0 * u.arcsec)
     out_df['xmm_id'] = [",".join(ids) if ids else None for ids in xmm_matches]
 
     # Write to CSV
