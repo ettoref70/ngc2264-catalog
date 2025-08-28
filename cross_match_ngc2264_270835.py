@@ -38,15 +38,6 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from matplotlib.transforms import offset_copy
 
-from astropy.io import fits
-from astropy.wcs import WCS
-from astropy.visualization import ImageNormalize, AsinhStretch, PercentileInterval
-from astroquery.skyview import SkyView
-from astropy.utils.data import download_file
-import io
-import requests
-import time
-
 try:
     from astroquery.gaia import Gaia
     # Remove default row limit to retrieve all sources
@@ -68,13 +59,8 @@ except ImportError as exc:
 
 import os
 # Directory to cache downloaded catalogs
-
 CACHE_DIR = "catalogs"
 os.makedirs(CACHE_DIR, exist_ok=True)
-
-# Subdirectory for cached sky images (e.g., 2MASS J cutouts)
-IMAGES_DIR = os.path.join(CACHE_DIR, "2MASS_J")
-os.makedirs(IMAGES_DIR, exist_ok=True)
 
 import argparse
 
@@ -601,7 +587,7 @@ def cross_match(source_df: pd.DataFrame,
             end = min(start + per_page, total)
             indices = list(range(start, end))
             fig, axes = plt.subplots(nrows, ncols, figsize=(11, 8.5), constrained_layout=True)
-            axes_flat = np.atleast_1d(axes).ravel()
+            axes_flat = axes.flatten()
             for ax in axes_flat[len(indices):]:
                 fig.delaxes(ax)
             # Plot each source in this page
@@ -711,7 +697,6 @@ def cross_match(source_df: pd.DataFrame,
                 ax.set_xlim(-margin, margin)
                 ax.set_ylim(-margin, margin)
                 ax.set_aspect('equal', 'box')
-                ax.invert_xaxis()
                 ax.set_xlabel('ΔRA [arcsec]', labelpad=6)
                 ax.set_ylabel('ΔDec [arcsec]', labelpad=6)
                 ax.legend(loc='lower right', fontsize='small')
@@ -759,180 +744,13 @@ def cross_match(source_df: pd.DataFrame,
     return matches
 
 
-def fetch_2mass_j_image(center: 'SkyCoord', width_deg: float, height_deg: float):
-    """Fetch a 2MASS J-band cutout via SkyView (with retries),
-    falling back to CDS hips2fits if needed. Images are cached on disk.
-
-    Set environment variable TMASS_FETCH to control behaviour:
-      - 'auto'     : try SkyView, then fall back to HiPS on failure (default)
-      - 'hips'     : use HiPS directly (skip SkyView)
-      - 'skyview'  : use SkyView only (no fallback)
-
-    Returns (data, WCS) or (None, None) on failure.
-    """
-    # Cache path under images directory
-    cache_name = os.path.join(
-        IMAGES_DIR,
-        f"2MASSJ_RA{center.ra.deg:.5f}_DEC{center.dec.deg:.5f}_W{width_deg:.4f}_H{height_deg:.4f}.fits"
-    )
-    refresh = globals().get("REFRESH", False)
-    mode = os.environ.get("TMASS_FETCH", "auto").lower().strip()
-
-    if (not refresh) and os.path.exists(cache_name):
-        print(f"[2MASS J] cache hit → {cache_name}")
-        try:
-            with fits.open(cache_name, memmap=False) as hdul:
-                data = hdul[0].data
-                wcs = WCS(hdul[0].header)
-            return data, wcs
-        except Exception as e:
-            print(f"[2MASS J] cache read failed ({e}), will re-download …")
-
-    def _fetch_via_hips() -> tuple:
-        """Final fallback: use CDS HiPS → FITS service."""
-        try:
-            print("[2MASS J] attempting hips2fits …")
-            fov = max(width_deg, height_deg)
-            # Aim for ~1"/pix, clamp size to [128, 2048]
-            size = int(np.clip(round((fov * 3600.0) / 1.0), 128, 2048))
-            params = {
-                'hips': 'CDS/P/2MASS/J',
-                'ra': center.ra.deg,
-                'dec': center.dec.deg,
-                'fov': fov,
-                'width': size,
-                'height': size,
-                'projection': 'TAN',
-                'format': 'fits',
-            }
-            endpoints = [
-                'https://alasky.u-strasbg.fr/hips-image-services/hips2fits',
-                'https://skyview.gsfc.nasa.gov/current/cgi/hips2fits.pl',
-            ]
-            sess = requests.Session()
-            for base in endpoints:
-                try:
-                    print(f"[2MASS J] hips2fits GET {base} …")
-                    resp = sess.get(base, params=params, timeout=30)
-                    if resp.ok and resp.content:
-                        with fits.open(io.BytesIO(resp.content), memmap=False) as hdul:
-                            hdul.writeto(cache_name, overwrite=True)
-                        print(f"[2MASS J] saved (hips2fits) → {cache_name}")
-                        with fits.open(cache_name, memmap=False) as hdul:
-                            data = hdul[0].data
-                            wcs = WCS(hdul[0].header)
-                        return data, wcs
-                    else:
-                        print(f"[2MASS J] hips2fits status {resp.status_code}")
-                except Exception as e2:
-                    print(f"[2MASS J] hips2fits error at {base}: {e2}")
-        except Exception as e3:
-            print(f"[2MASS J] hips2fits fallback error: {e3}")
-        return None, None
-
-    # If user forces HiPS, go straight there
-    if mode == 'hips':
-        return _fetch_via_hips()
-
-    # Try multiple attempts with exponential backoff via SkyView
-    surveys = ['2MASS J', '2MASS-J']
-    max_tries = 4
-    delays = [1, 3, 7, 15]
-    last_error = None
-    early_fallback = False
-
-    # If user forces SkyView, we will not call HiPS later
-    force_skyview = (mode == 'skyview')
-
-    for attempt in range(max_tries):
-        for survey in surveys:
-            try:
-                print(f"[2MASS J] attempt {attempt+1}/{max_tries} via SkyView.get_images(survey='{survey}') …")
-                imgs = SkyView.get_images(position=center, survey=[survey],
-                                          width=width_deg * u.deg, height=height_deg * u.deg)
-                if imgs:
-                    hdu = imgs[0][0]
-                    hdu.writeto(cache_name, overwrite=True)
-                    print(f"[2MASS J] saved → {cache_name}")
-                    data = hdu.data
-                    wcs = WCS(hdu.header)
-                    return data, wcs
-                else:
-                    print(f"[2MASS J] SkyView.get_images returned no image for survey '{survey}'")
-            except Exception as e:
-                last_error = e
-                msg = str(e)
-                print(f"[2MASS J] get_images error (survey '{survey}'): {e}")
-                # Early fallback if we hit a hard socket error
-                if ('Connection aborted' in msg) or isinstance(e, (OSError, ConnectionError)):
-                    early_fallback = True
-                    break
-        if early_fallback:
-            break
-        # Fallback within this attempt: try URL list then direct download via astropy
-        try:
-            print(f"[2MASS J] attempt {attempt+1}/{max_tries} via get_image_list + direct download …")
-            urls = SkyView.get_image_list(position=center, survey=['2MASS J'],
-                                          width=width_deg * u.deg, height=height_deg * u.deg)
-            if not urls:
-                urls = SkyView.get_image_list(position=center, survey=['2MASS-J'],
-                                              width=width_deg * u.deg, height=height_deg * u.deg)
-            if urls:
-                url = urls[0]
-                print(f"[2MASS J] downloading URL → {url}")
-                tmp_path = download_file(url, cache=False, timeout=120)
-                with fits.open(tmp_path, memmap=False) as hdul:
-                    hdul.writeto(cache_name, overwrite=True)
-                print(f"[2MASS J] saved → {cache_name}")
-                with fits.open(cache_name, memmap=False) as hdul:
-                    data = hdul[0].data
-                    wcs = WCS(hdul[0].header)
-                return data, wcs
-            else:
-                print("[2MASS J] get_image_list returned no URLs")
-        except Exception as e:
-            last_error = e
-            print(f"[2MASS J] get_image_list/download error: {e}")
-            if 'Connection aborted' in str(e):
-                early_fallback = True
-        # Backoff before next attempt unless we will fall back now
-        if early_fallback:
-            break
-        if attempt < max_tries - 1:
-            delay = delays[min(attempt, len(delays)-1)]
-            print(f"[2MASS J] retrying in {delay}s …")
-            try:
-                time.sleep(delay)
-            except KeyboardInterrupt:
-                print("[2MASS J] interrupted during backoff")
-                break
-
-    if force_skyview:
-        print("[2MASS J] ERROR: SkyView mode failed and HiPS fallback disabled (TMASS_FETCH=skyview)")
-        return None, None
-
-    # Fall back to HiPS if allowed
-    data, wcs = _fetch_via_hips()
-    if data is not None:
-        return data, wcs
-
-    # All attempts failed
-    if last_error is not None:
-        print(f"[2MASS J] ERROR: exhausted retries: {last_error}")
-    else:
-        print("[2MASS J] ERROR: exhausted retries with no specific exception")
-    return None, None
-
 # === Post-merge plotting so panels reflect final combined_df ===
 def plot_after_merge(combined_df: pd.DataFrame,
                      other_df: pd.DataFrame,
                      id_col: str,
                      all_catalogs: dict,
                      pdf_path: str,
-                     plot_mode: str = 'match',
-                     ncols: int = 2,
-                     nrows: int = 2,
-                     invert_cmap: bool = False) -> None:
+                     plot_mode: str = 'match') -> None:
     key = id_col.replace('_id', '')
     params = all_catalogs.get(key, {}) if isinstance(all_catalogs, dict) else {}
     factor = float(params.get('factor', 1.0))
@@ -980,6 +798,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     and ((isinstance(val, float) and np.isnan(val)) or val == -1)))
 
     pdf = PdfPages(pdf_path) if pdf_path else None
+    ncols, nrows = 2, 2
     per_page = ncols * nrows
     total = len(other_df)
 
@@ -995,7 +814,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
         end = min(start + per_page, total)
         indices = list(range(start, end))
         fig, axes = plt.subplots(nrows, ncols, figsize=(11, 8.5), constrained_layout=True)
-        axes_flat = np.atleast_1d(axes).ravel()
+        axes_flat = axes.flatten()
         for ax in axes_flat[len(indices):]:
             fig.delaxes(ax)
         for ax_idx, j in enumerate(indices):
@@ -1009,74 +828,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
             dy_oth = (other_df['dec_deg'] - dec0) * 3600.0
             dx_src = (combined_df['ra_deg'] - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
             dy_src = (combined_df['dec_deg'] - dec0) * 3600.0
-            # Global nearest master by angular separation (arcsec), even outside the panel margin
-            dist_all = np.hypot(dx_src.values, dy_src.values)
-            nearest_sep_arcsec = float(np.min(dist_all)) if len(dist_all) else None
 
             # Determine plotting margin in arcsec
             margin = max(oth_maj_plot[j], oth_min_plot[j]) * 2.0
-            margin = max(margin, 5.0)  # at least ±2.5" half-width
-
-            # If this is a 2MASS panel, draw a 2MASS J-band background aligned via WCS
-            if key == '2MASS':
-                center_icrs = SkyCoord(ra=ra0 * u.deg, dec=dec0 * u.deg, frame='icrs')
-                fov_deg = (2.0 * margin) / 3600.0  # full width/height in degrees
-                data_img, wcs_img = fetch_2mass_j_image(center_icrs, fov_deg, fov_deg)
-                if data_img is not None and wcs_img is not None:
-                    ny, nx = data_img.shape[0], data_img.shape[1]
-                    # Use mid-lines to anchor left/right and bottom/top explicitly
-                    x_left, x_right = 0.0, float(nx - 1)
-                    y_bot, y_top = 0.0, float(ny - 1)
-                    x_mid, y_mid = (nx - 1) / 2.0, (ny - 1) / 2.0
-
-                    # World at left/right midpoints
-                    lr_pix = np.array([[x_left, y_mid], [x_right, y_mid]], dtype=float)
-                    lr_world = wcs_img.wcs_pix2world(lr_pix, 0)
-                    ra_left,  ra_right  = lr_world[0, 0], lr_world[1, 0]
-                    # World at bottom/top midpoints
-                    bt_pix = np.array([[x_mid, y_bot], [x_mid, y_top]], dtype=float)
-                    bt_world = wcs_img.wcs_pix2world(bt_pix, 0)
-                    dec_bot, dec_top = bt_world[0, 1], bt_world[1, 1]
-
-                    # Convert to arcsec offsets relative to panel center (east-positive, north-positive)
-                    dx_left  = (ra_left  - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
-                    dx_right = (ra_right - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
-                    dy_bot_o = (dec_bot  - dec0) * 3600.0
-                    dy_top_o = (dec_top  - dec0) * 3600.0
-
-                    # Preserve left→right and bottom→top orientation; do not sort
-                    extent = [float(dx_left), float(dx_right), float(dy_bot_o), float(dy_top_o)]
-
-                    # Contrast-friendly normalization: compress dynamic range so faint sources remain visible
-                    # Controls (optional): TMASS_PERCENT (default 99.8), TMASS_ASINH_A (default 0.2)
-                    try:
-                        percent = float(os.environ.get('TMASS_PERCENT', '99.8'))
-                    except Exception:
-                        percent = 99.8
-                    try:
-                        a_param = float(os.environ.get('TMASS_ASINH_A', '0.2'))
-                    except Exception:
-                        a_param = 0.2
-
-                    # Compute robust min/max using upper percentile; lower bound implied by (100 - percent)/2
-                    interval = PercentileInterval(percent)
-                    vmin, vmax = interval.get_limits(data_img)
-                    norm = ImageNormalize(vmin=vmin, vmax=vmax,
-                                           stretch=AsinhStretch(a=a_param), clip=True)
-
-                    # Optional inversion of grayscale via CLI flag or env var TMASS_INVERT
-                    invert_env = str(os.environ.get('TMASS_INVERT', '0')).lower() in ('1', 'true', 'yes', 'on')
-                    cmap_name = 'gray_r' if (invert_cmap or invert_env) else 'gray'
-
-                    ax.imshow(
-                        data_img,
-                        cmap=cmap_name,
-                        origin='lower',
-                        extent=extent,
-                        zorder=0,
-                        interpolation='nearest',
-                        norm=norm
-                    )
+            margin = max(margin, 2.5)
 
             # Plot new-catalog background (light blue)
             for k in range(len(other_df)):
@@ -1161,28 +916,19 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             else:
                                 _maj_m = float(crow['errMaj'])
                                 _min_m = float(crow['errMin'])
-                            lw = 1.8 if kcat == 'gaia' else 1.2
                             ell_m = Ellipse((dxm, dym), width=2*_maj_m, height=2*_min_m,
                                             angle=crow['errPA'], edgecolor=CAT_COLORS.get(kcat, 'red'), linestyle='-',
-                                            linewidth=lw, fill=False, label=None)
+                                            linewidth=1.2, fill=False, label=None)
                             ax.add_patch(ell_m)
-                            # Emphasize matched GAIA position with a colored plus
-                            if kcat == 'gaia':
-                                ax.plot(dxm, dym, marker='+', color=CAT_COLORS['gaia'],
-                                        markersize=7, markeredgewidth=1.2, linestyle='None')
                             drawn_components.add((kcat, lookup_key))
 
             # Background: draw components for UNMATCHED master rows in lighter/transparent colors
             # and draw a thin gray cross at every master position
             matched_set = set(master_indices)
             for m in cand_indices:
-                if m not in matched_set:
-                    # gray cross at master position (unmatched only)
-                    ax.plot(dx_src.iloc[m], dy_src.iloc[m], marker='+', color='gray', markersize=5,
-                            markeredgewidth=0.6, linestyle='None')
-                else:
-                    # matched rows are emphasized elsewhere (e.g., GAIA plus & thicker ellipse)
-                    pass
+                # gray cross at master position
+                ax.plot(dx_src.iloc[m], dy_src.iloc[m], marker='+', color='gray', markersize=5,
+                        markeredgewidth=0.6, linestyle='None')
                 if m in matched_set:
                     continue  # matched components already drawn above with solid colors
                 mrow = combined_df.iloc[m]
@@ -1219,32 +965,6 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                      angle=crow['errPA'], edgecolor=CAT_COLORS.get(kcat, 'red'), linestyle='-',
                                      linewidth=0.8, fill=False, alpha=0.28)
                     ax.add_patch(ell_bg)
-
-            # --- Compute compact diagnostics (best separation and Mahalanobis D²) for title ---
-            def _cov_from_axes(maj_as, min_as, pa_deg):
-                phi = np.deg2rad(pa_deg)
-                sphi, cphi = np.sin(phi), np.cos(phi)
-                vmaj = np.array([sphi, cphi])
-                vmin = np.array([-cphi, sphi])
-                return (maj_as*maj_as) * np.outer(vmaj, vmaj) + (min_as*min_as) * np.outer(vmin, vmin)
-
-            best_sep = None
-            best_d2 = None
-            if master_indices:
-                Cnew = _cov_from_axes(oth_maj_plot[j], oth_min_plot[j], float(other_df.iloc[j]['errPA']))
-                for m in master_indices:
-                    vec = np.array([float(dx_src.iloc[m]), float(dy_src.iloc[m])])  # arcsec
-                    mrow = combined_df.iloc[m]
-                    Cmas = _cov_from_axes(float(mrow['errMaj']), float(mrow['errMin']), float(mrow['errPA']))
-                    Csum = Cnew + Cmas
-                    try:
-                        invC = la.inv(Csum)
-                    except la.LinAlgError:
-                        invC = la.inv(Csum + np.eye(2) * 1e-6)
-                    d2 = float(vec.dot(invC).dot(vec))
-                    sep = float(np.hypot(*vec))
-                    if best_d2 is None or d2 < best_d2:
-                        best_d2, best_sep = d2, sep
 
             # === Dynamic association table across available catalogs (exclude current catalog) ===
             # Determine which catalogs to include based on the candidate rows; exclude current catalog `key`
@@ -1291,84 +1011,48 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 # Compute column widths from headers and rows (in characters)
                 table_data = [headers] + [cells for (cells, _) in raw_rows]
                 col_w = [max(len(str(r[i])) for r in table_data) for i in range(len(headers))]
-
-                # --- Scale table size with panel grid ---
-                base_font = 9
-                base_line_h = 0.040  # slightly tighter than before
-                # Scale roughly with panel area (relative to 2x2)
-                area_scale = (4.0 / float(max(1, ncols * nrows))) ** 0.5
-                font_size = int(round(np.clip(base_font * area_scale, 6, 12)))
-                line_h = base_line_h * (font_size / base_font)
-
-                # Adjust top anchor a bit when many panels are stacked
-                y0 = 0.95 - 0.02 * max(0, max(nrows, ncols) - 2)
-                y0 = max(0.85, min(0.95, y0))
-
-                # Checkmark space in first column if any matched rows
-                has_match_row = any(is_m for (_, is_m) in raw_rows)
-                if has_match_row and len(col_w) > 0:
-                    col_w[0] += 2  # reserve space for '✓ '
-
-                # Compute how many rows fit (leave a small bottom margin)
-                bottom_margin = 0.10
-                # Minus only the header line now (no separator)
-                max_rows = max(1, int((y0 - bottom_margin) / line_h) - 1)
-                rows_limited = raw_rows[:max_rows]
-
-                # Character width in points for monospace font (approx)
-                char_w_pts = font_size * 0.6
-
+                # Layout parameters
+                y0 = 0.95
+                line_h = 0.055  # axes fraction per line
+                font_size = 9
+                char_w_pts = font_size * 0.6  # approximate monospace char width in points
                 # Compute x-offsets in points for each column (include two spaces between columns)
                 x_offsets = []
                 acc = 0.0
                 for i in range(len(headers)):
                     x_offsets.append(acc)
                     acc += (col_w[i] + 2) * char_w_pts
-
-                # Draw header per column with catalog colors (no separator line)
+                # Draw header per column with catalog colors
                 for i, head in enumerate(headers):
                     trans = offset_copy(ax.transAxes, fig=fig, x=x_offsets[i], y=0, units='points')
                     ax.text(0.05, y0, head, transform=trans,
                             va='top', ha='left', family='monospace', fontsize=font_size,
                             fontweight='bold', color=CAT_COLORS.get(display_cats[i], 'black'))
-
-                # Draw rows per column, color-coded and bold if matched; add '✓ ' on matched rows
-                for r_idx, (cells, is_matched) in enumerate(rows_limited):
-                    y = y0 - (r_idx + 1) * line_h
+                # Draw separator as dashes per column (neutral color)
+                for i in range(len(headers)):
+                    trans = offset_copy(ax.transAxes, fig=fig, x=x_offsets[i], y=0, units='points')
+                    ax.text(0.05, y0 - line_h, '-' * col_w[i], transform=trans,
+                            va='top', ha='left', family='monospace', fontsize=font_size)
+                # Draw rows per column, color-coded and bold if matched
+                for r_idx, (cells, is_matched) in enumerate(raw_rows):
+                    y = y0 - (r_idx + 2) * line_h
                     for i, cell in enumerate(cells):
-                        text_cell = str(cell)
-                        if i == 0:
-                            prefix = '✓ ' if is_matched else '  '
-                            text_cell = prefix + text_cell
                         trans = offset_copy(ax.transAxes, fig=fig, x=x_offsets[i], y=0, units='points')
-                        ax.text(0.05, y, text_cell.ljust(col_w[i]), transform=trans,
+                        ax.text(0.05, y, cell.ljust(col_w[i]), transform=trans,
                                 va='top', ha='left', family='monospace', fontsize=font_size,
                                 fontweight=('bold' if is_matched else 'normal'),
                                 color=CAT_COLORS.get(display_cats[i], 'black'))
 
-                # If there are more rows than fit, add a small ellipsis line
-                if len(rows_limited) < len(raw_rows):
-                    y = y0 - (len(rows_limited) + 1) * line_h
-                    trans = offset_copy(ax.transAxes, fig=fig, x=x_offsets[0], y=0, units='points')
-                    ax.text(0.05, y, f"… (+{len(raw_rows) - len(rows_limited)} more)", transform=trans,
-                            va='top', ha='left', family='monospace', fontsize=font_size, color='gray')
-
-
-            # Title with short id for the current catalog + compact diagnostics
+            # Title with short id for the current catalog
             short_new = _short_of(key, new_id)
-            title = f"{key} #{short_new}" if short_new is not None else f"{key}"
-            if (best_sep is not None) and (best_d2 is not None):
-                # Use Unicode double-prime for arcsec and superscript 2 for D²
-                title += f" — sep={best_sep:.2f}″, D²={best_d2:.2f}"
-            elif nearest_sep_arcsec is not None:
-                # No matches: report separation to the closest master source
-                title += f" — closest={nearest_sep_arcsec:.2f}″"
-            ax.set_title(title, pad=10)
+            if short_new is not None:
+                ax.set_title(f"{key} #{short_new}", pad=10)
+            else:
+                ax.set_title(f"{key}", pad=10)
 
             ax.set_xlim(-margin, margin)
             ax.set_ylim(-margin, margin)
             ax.set_aspect('equal', 'box')
-            ax.invert_xaxis()
             ax.set_xlabel('ΔRA [arcsec]', labelpad=6)
             ax.set_ylabel('ΔDec [arcsec]', labelpad=6)
             legend_handles = []
@@ -1393,22 +1077,9 @@ def main() -> None:
                         help='Re-download all catalogs, ignoring cache')
     parser.add_argument('--pdf', action='store_true', default=True,
                         help='Generate PDF of match ellipses per catalog')
-    parser.add_argument('--grid', default='1x1',
-                        help="Panels per PDF page as CxR, e.g. '3x2' for 3 columns × 2 rows")
-    parser.add_argument('--invert-cmap', action='store_true', default=True,
-                        help='Invert grayscale colormap for background images (2MASS J)')
     args, _ = parser.parse_known_args()
     global REFRESH
     REFRESH = args.refresh
-    # Parse grid argument (columns x rows)
-    try:
-        _gc, _gr = args.grid.lower().split('x')
-        GRID_COLS, GRID_ROWS = max(1, int(_gc)), max(1, int(_gr))
-    except Exception:
-        print("[warn] --grid format invalid; using default 2x2")
-        GRID_COLS, GRID_ROWS = 2, 2
-    global INVERT_CMAP
-    INVERT_CMAP = args.invert_cmap
     # Per-catalog parameters: factor and min_radius (arcsec)
     catalog_params = {
         'gaia':    {'factor': 2.0, 'min_radius': 0.05},
@@ -1419,7 +1090,7 @@ def main() -> None:
     }
     # Define the central coordinate of NGC 2264 and search radius
     center = SkyCoord(ra=100.25 * u.deg, dec=9.883333 * u.deg, frame='icrs')
-    radius = 0.02 * u.deg
+    radius = 0.1 * u.deg
 
     print("Querying Gaia DR3 ...")
     gaia = query_gaia(center, radius)
@@ -1461,8 +1132,8 @@ def main() -> None:
     for df_other, id_col in [
         (tmass,     '2MASS'),
         (wise,      'wise_id'),
-        (chan,      'chandra_id'),
-        (xmm,       'xmm_id'),
+        # (chan,      'chandra_id'),
+        # (xmm,       'xmm_id'),
     ]:
         # Strip '_id' suffix for catalog key
         key = id_col.replace('_id', '')
@@ -1599,10 +1270,7 @@ def main() -> None:
                 id_col,
                 catalogs,
                 pdf_path=f"{key}_matches.pdf",
-                plot_mode='match',
-                ncols=GRID_COLS,
-                nrows=GRID_ROWS,
-                invert_cmap=INVERT_CMAP
+                plot_mode='match'
             )
     # Keep only coordinate, error ellipse, and identification columns in the final catalog
     # id_columns = [
