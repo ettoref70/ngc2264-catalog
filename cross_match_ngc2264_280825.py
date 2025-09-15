@@ -60,24 +60,6 @@ try:
     from astropy.coordinates import SkyCoord
     import astropy.units as u
     import pandas as pd
-    try:
-        from scipy.io import readsav  # optional, for IDL .sav files
-    except Exception:
-        readsav = None
-    # Optional NV5 IDL Python bridge
-    try:
-        # Attempt import directly
-        from idlpy import IDL as IDLBridge  # type: ignore
-    except Exception:
-        # Try common installation path
-        try:
-            import sys as _sys
-            _bridge_dir = '/Applications/NV5/idl/lib/bridges'
-            if os.path.isdir(_bridge_dir) and _bridge_dir not in _sys.path:
-                _sys.path.append(_bridge_dir)
-            from idlpy import IDL as IDLBridge  # type: ignore
-        except Exception:
-            IDLBridge = None
 except ImportError as exc:
     print("Missing required packages: {}".format(exc))
     print("Install dependencies with: pip install astropy astroquery pandas")
@@ -129,7 +111,7 @@ def query_gaia(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     rad_deg = radius.to(u.deg).value
     adql = f"""
     SELECT ra, dec, ra_error, dec_error, ra_dec_corr,
-           source_id, phot_g_mean_mag, ruwe
+           source_id, phot_g_mean_mag
       FROM gaiadr3.gaia_source
      WHERE CONTAINS(
              POINT('ICRS', ra, dec),
@@ -142,7 +124,7 @@ def query_gaia(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     df = results.to_pandas()[[
         'ra', 'dec',
         'ra_error', 'dec_error', 'ra_dec_corr',
-        'source_id', 'phot_g_mean_mag', 'ruwe'
+        'source_id', 'phot_g_mean_mag'
     ]]
     # Rename and cast Gaia ID to integer
     df = df.rename(columns={
@@ -152,8 +134,7 @@ def query_gaia(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
         'dec_error': 'dec_err_mas',
         'ra_dec_corr': 'ra_dec_corr',
         'source_id': 'gaia_id',
-        'phot_g_mean_mag': 'Gmag',
-        'ruwe': 'ruwe'
+        'phot_g_mean_mag': 'Gmag'
     })
     df['gaia_id'] = df['gaia_id'].astype('int64')
     # Convert milliarcsecond errors to degrees
@@ -181,14 +162,11 @@ def query_gaia(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     # Position angle east of north (0°=north)
     df['errPA'] = (np.degrees(np.arctan2(cov_rd, lam1 - a)) % 360.0)
     # Drop per-axis uncertainty columns (_mas converted to _deg), raw mas columns, and ra_dec_corr
-    drop_cols = [
+    df = df.drop(columns=[
         'ra_err_mas', 'dec_err_mas',
         'ra_err_deg', 'dec_err_deg',
         'ra_dec_corr'
-    ]
-    for _c in list(drop_cols):
-        if _c in df.columns:
-            df = df.drop(columns=[_c])
+    ])
     df.to_csv(cache_file, index=False)
     return df
 
@@ -206,15 +184,11 @@ def query_2mass(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     refresh = globals().get("REFRESH", False)
     if not refresh and os.path.exists(cache_file):
         return pd.read_csv(cache_file)
-    # Request a broad set of columns including quality flags so that
-    # we can cache the complete table and filter later.
     v = Vizier(
         columns=[
             'RAJ2000', 'DEJ2000',
             'errMaj', 'errMin', 'errPA',
-            'Jmag', 'Hmag', 'Kmag', '2MASS',
-            # Common 2MASS quality/contamination flags (if available)
-            'Qflg', 'Cflg', 'Xflg', 'prox'
+            'Jmag', 'Hmag', 'Kmag', '2MASS'
         ],
         catalog='II/246', row_limit=-1
     )
@@ -242,12 +216,13 @@ def query_2mass(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     df['ra_err_deg']  = df['pos_err_min_arcsec'] / 3600.0
     df['dec_err_deg'] = df['pos_err_maj_arcsec'] / 3600.0
     # Drop per-axis uncertainty columns and raw positional errors
-    for _c in ['ra_err_deg', 'dec_err_deg', 'pos_err_maj_arcsec', 'pos_err_min_arcsec', 'pos_err_pa_deg']:
-        if _c in df.columns:
-            df = df.drop(columns=[_c])
+    df = df.drop(columns=['ra_err_deg', 'dec_err_deg', 'pos_err_maj_arcsec', 'pos_err_min_arcsec', 'pos_err_pa_deg'])
     df.to_csv(cache_file, index=False)
-    # Return the full dataframe (with added errMaj/errMin/errPA) so filters can use flags
-    return df
+    return df[[
+        'ra_deg', 'dec_deg',
+        'errMaj', 'errMin', 'errPA',
+        'Jmag', 'Hmag', 'Kmag', '2MASS'
+    ]]
 
 
 def query_wise(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
@@ -265,13 +240,8 @@ def query_wise(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
         return pd.read_csv(cache_file)
     # Use Vizier to query the AllWISE PSC (II/328/allwise)
     v = Vizier(
-        columns=[
-            'RAJ2000', 'DEJ2000',
-            'W1mpro', 'W2mpro', 'W3mpro', 'W4mpro',
-            'AllWISE', 'eeMaj', 'eeMin', 'eePA',
-            # Quality flags commonly used in AllWISE
-            'ph_qual', 'ccf', 'ext_flg', 'w1snr', 'w2snr'
-        ],
+        columns=['RAJ2000', 'DEJ2000', 'W1mpro', 'W2mpro', 'W3mpro', 'W4mpro',
+                 'AllWISE', 'eeMaj', 'eeMin', 'eePA'],
         catalog='II/328/allwise', row_limit=-1
     )
     tables = v.query_region(center, radius=radius)
@@ -310,13 +280,10 @@ def query_wise(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
         + [c for c in phot_cols_sorted if c]
         + ['wise_id', 'errMaj', 'errMin', 'errPA']
     )
-    # Drop per-axis uncertainty and raw positional error columns (if present)
-    for _c in ['ra_err_deg', 'dec_err_deg', 'pos_err_maj_arcsec', 'pos_err_min_arcsec', 'pos_err_pa_deg']:
-        if _c in df.columns:
-            df = df.drop(columns=[_c])
+    # Drop per-axis uncertainty and raw positional error columns
+    df = df.drop(columns=['ra_err_deg', 'dec_err_deg', 'pos_err_maj_arcsec', 'pos_err_min_arcsec', 'pos_err_pa_deg'])
     df.to_csv(cache_file, index=False)
-    # Return full df with added errMaj/errMin/errPA and quality columns
-    return df
+    return df[final_cols]
 
 
 def query_chandra(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
@@ -364,172 +331,14 @@ def query_chandra(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     # Derive RA/Dec uncertainties (symmetric error, arcsec → deg)
     tab['ra_err_deg']  = tab['pos_err_arcsec'] / 3600.0
     tab['dec_err_deg'] = tab['pos_err_arcsec'] / 3600.0
-    # Drop per-axis uncertainty and raw positional error columns (if present)
-    for _c in ['ra_err_deg', 'dec_err_deg', 'pos_err_arcsec']:
-        if _c in tab.columns:
-            tab = tab.drop(columns=[_c])
+    # Drop per-axis uncertainty and raw positional error columns
+    tab = tab.drop(columns=['ra_err_deg', 'dec_err_deg', 'pos_err_arcsec'])
     tab.to_csv(cache_file, index=False)
     return tab[[
         'ra_deg', 'dec_deg',
         'errMaj', 'errMin', 'errPA',
         'chandra_id'
     ]]
-
-
-def query_chandra_idl(center: SkyCoord, radius: u.Quantity,
-                      save_path: str = "/Users/ettoref/ASTRONOMY/DATA/N2264_XMM_alt/N2264.save",
-                      struct_name: str = "N2264_acis12",
-                      backend: str | None = None) -> pd.DataFrame:
-    """Load Chandra ACIS sources from a local IDL .sav file.
-
-    Expects a structure named `N2264_acis12` with at least RA/Dec and a
-    sequential identifier in the tag `pub_n`. RA/Dec may be provided as
-    degrees or sexagesimal strings. A positional error column (e.g.,
-    `epos`) will be used if present; otherwise a default of 1.0 arcsec is
-    assigned. The function filters the full table to the cone defined by
-    (center, radius) and returns a DataFrame with standard columns.
-    """
-    # Use cached CSV if available and refresh is false
-    cache_file = os.path.join(
-        CACHE_DIR,
-        f"Chandra_RA{center.ra.deg:.4f}_DEC{center.dec.deg:.4f}_R{radius.value:.4f}.csv"
-    )
-    refresh = globals().get("REFRESH", False)
-    if (not refresh) and os.path.exists(cache_file):
-        try:
-            return pd.read_csv(cache_file)
-        except Exception:
-            pass
-    # Decide backend: 'idlpy', 'scipy', or 'auto'
-    method = (backend or os.environ.get('CHANDRA_IDL_BACKEND', 'auto')).lower()
-    used_backend = None
-    arr = None
-    # Prefer IDL bridge if available and requested/auto
-    if (method in ('idlpy', 'auto')) and ('IDLBridge' in globals()) and (IDLBridge is not None):
-        try:
-            print(f"[Chandra IDL] using idlpy backend; restoring '{save_path}' …", flush=True)
-            IDLBridge.run(f'RESTORE, "{save_path}", /V')
-            # Fetch structure by name
-            arr = getattr(IDLBridge, struct_name)
-            used_backend = 'idlpy'
-        except Exception as e:
-            print(f"[Chandra IDL] idlpy backend failed: {e}", flush=True)
-            arr = None
-    # Fallback to SciPy readsav
-    if arr is None:
-        if readsav is None:
-            raise RuntimeError("scipy is required to read IDL .sav files (pip install scipy).")
-        uncomp_path = os.path.join(CACHE_DIR, "N2264_uncompressed.sav")
-        print(f"[Chandra IDL] using scipy readsav; reading '{save_path}' …", flush=True)
-        t0 = time.time()
-        try:
-            try:
-                sav = readsav(save_path, python_dict=True, uncompressed_file_name=uncomp_path, verbose=True)
-            except TypeError:
-                sav = readsav(save_path, verbose=True)
-        except Exception as e:
-            raise RuntimeError(f"Failed to read IDL save file '{save_path}': {e}")
-        print(f"[Chandra IDL] read complete in {time.time()-t0:.1f}s", flush=True)
-        # Locate the structure key case-insensitively
-        key = None
-        for k in sav.keys():
-            if str(k).lower() == struct_name.lower():
-                key = k
-                break
-        if key is None:
-            raise KeyError(f"Structure '{struct_name}' not found in '{save_path}'. Available: {list(sav.keys())}")
-        arr = sav[key]
-        used_backend = 'scipy'
-    # Normalize to a numpy structured array if coming from idlpy
-    try:
-        np_arr = np.array(arr)
-    except Exception:
-        np_arr = arr
-    # Access dtype names if it's a structured array
-    if not hasattr(np_arr, 'dtype') or not hasattr(np_arr.dtype, 'names') or np_arr.dtype.names is None:
-        raise TypeError(f"Unexpected type for '{struct_name}' (backend={used_backend}): {type(arr)}")
-    fields = list(np_arr.dtype.names)
-
-    def find_field(candidates):
-        for c in candidates:
-            for f in fields:
-                if f.lower() == c.lower():
-                    return f
-        return None
-
-    # Identify RA/Dec columns across common naming
-    ra_field = find_field(['ra_deg', 'ra', 'ra2000', 'raj2000', 'ra_icrs'])
-    dec_field = find_field(['dec_deg', 'dec', 'de2000', 'dej2000', 'dec_icrs', 'de'])
-    if ra_field is None or dec_field is None:
-        raise KeyError(f"Could not find RA/Dec columns in '{struct_name}'. Fields: {fields}")
-    ra_col = np_arr[ra_field]
-    dec_col = np_arr[dec_field]
-
-    # Convert RA/Dec to degrees regardless of input representation
-    def _to_deg(ra_vals, dec_vals):
-        # Flatten one-level arrays of shape (N,) or (N,1)
-        def _flat(x):
-            x = np.array(x)
-            return x.reshape(-1) if x.ndim > 1 else x
-        ra_v = _flat(ra_vals)
-        dec_v = _flat(dec_vals)
-        # If numeric, assume degrees
-        if np.issubdtype(ra_v.dtype, np.number) and np.issubdtype(dec_v.dtype, np.number):
-            return ra_v.astype(float), dec_v.astype(float)
-        # Otherwise, parse strings (bytes→str)
-        ra_s = [rv.decode('utf-8') if isinstance(rv, (bytes, np.bytes_)) else str(rv) for rv in ra_v]
-        dec_s = [dv.decode('utf-8') if isinstance(dv, (bytes, np.bytes_)) else str(dv) for dv in dec_v]
-        try:
-            coords = SkyCoord(ra_s, dec_s, unit=(u.hourangle, u.deg), frame='icrs')
-            return coords.ra.deg, coords.dec.deg
-        except Exception:
-            # Try both as degrees
-            coords = SkyCoord(ra_s, dec_s, unit=(u.deg, u.deg), frame='icrs')
-            return coords.ra.deg, coords.dec.deg
-
-    ra_deg, dec_deg = _to_deg(ra_col, dec_col)
-
-    # Positional error (arcsec) if available
-    err_field = find_field(['epos', 'pos_err', 'errpos', 'rpos'])
-    if err_field is not None:
-        err_arcsec = np.array(np_arr[err_field]).reshape(-1)
-        try:
-            err_arcsec = err_arcsec.astype(float)
-        except Exception:
-            err_arcsec = np.full_like(ra_deg, 1.0, dtype=float)
-    else:
-        err_arcsec = np.full_like(ra_deg, 1.0, dtype=float)
-
-    # Sequential identifier
-    id_field = find_field(['pub_n', 'id', 'srcid', 'num'])
-    if id_field is None:
-        raise KeyError("Could not find 'pub_n' (or fallback id) in the Chandra IDL structure")
-    chandra_id = np.array(np_arr[id_field]).reshape(-1)
-    try:
-        chandra_id = chandra_id.astype(int)
-    except Exception:
-        # If it's bytes/str, keep as string
-        chandra_id = chandra_id.astype(str)
-
-    df_full = pd.DataFrame({
-        'ra_deg': ra_deg,
-        'dec_deg': dec_deg,
-        'errMaj': err_arcsec,
-        'errMin': err_arcsec,
-        'errPA':  np.zeros_like(ra_deg, dtype=float),
-        'chandra_id': chandra_id,
-    })
-
-    # Spatial filter to (center, radius)
-    coords = SkyCoord(ra=df_full['ra_deg'].values * u.deg,
-                      dec=df_full['dec_deg'].values * u.deg, frame='icrs')
-    sep = coords.separation(center)
-    mask = sep <= radius
-    df = df_full.loc[mask].reset_index(drop=True)
-
-    # Cache to CSV consistent with other catalogs
-    df.to_csv(cache_file, index=False)
-    return df
 
 
 def query_xmm(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
@@ -570,203 +379,14 @@ def query_xmm(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     # Derive RA/Dec uncertainties (symmetric error, arcsec → deg)
     tab['ra_err_deg']  = tab['pos_err_arcsec'] / 3600.0
     tab['dec_err_deg'] = tab['pos_err_arcsec'] / 3600.0
-    # Drop per-axis uncertainty and raw positional error columns (if present)
-    for _c in ['ra_err_deg', 'dec_err_deg', 'pos_err_arcsec']:
-        if _c in tab.columns:
-            tab = tab.drop(columns=[_c])
+    # Drop per-axis uncertainty and raw positional error columns
+    tab = tab.drop(columns=['ra_err_deg', 'dec_err_deg', 'pos_err_arcsec'])
     tab.to_csv(cache_file, index=False)
     return tab[[
         'ra_deg', 'dec_deg',
         'errMaj', 'errMin', 'errPA',
         'xmm_id'
     ]]
-
-
-# -------------------- Quality filters per catalog --------------------
-def _print_filter_counts(name: str, total: int, kept: int) -> None:
-    dropped = total - kept
-    frac = (kept / total * 100.0) if total > 0 else 0.0
-    print(f"{name}: total={total}, after quality filters={kept} ({frac:.1f}% kept, {dropped} dropped)")
-
-
-def filter_gaia_quality(df: pd.DataFrame) -> pd.DataFrame:
-    total = len(df)
-    if total == 0:
-        _print_filter_counts('Gaia', 0, 0)
-        return df
-    mask = pd.Series(True, index=df.index)
-    if 'ruwe' in df.columns:
-        # Common astrometric quality cut
-        with np.errstate(invalid='ignore'):
-            mask &= (df['ruwe'] <= 1.4)
-    kept = int(mask.sum())
-    _print_filter_counts('Gaia', total, kept)
-    return df.loc[mask].reset_index(drop=True)
-
-
-def filter_2mass_quality(df: pd.DataFrame) -> pd.DataFrame:
-    total = len(df)
-    if total == 0:
-        _print_filter_counts('2MASS', 0, 0)
-        return df
-    mask = pd.Series(True, index=df.index)
-    # Photometric quality: require at least one of J/H/K with quality in {A,B,C}
-    qual_series = None
-    for col in ['ph_qual', 'Qflg', 'qflg']:
-        if col in df.columns:
-            qual_series = df[col].astype(str)
-            break
-    if qual_series is not None:
-        def good_any_abc(s: str) -> bool:
-            s = s.strip()
-            if len(s) == 0:
-                return False
-            # consider first three chars as J/H/K if present
-            candidates = list(s[:3])
-            return any(ch in ('A', 'B', 'C') for ch in candidates)
-        mask &= qual_series.apply(good_any_abc)
-    # Contamination flags: require zeros if available
-    for col in ['Cflg', 'cc_flg', 'ccflag']:
-        if col in df.columns:
-            s = df[col].astype(str)
-            mask &= s.apply(lambda x: all((c == '0') for c in list(x[:3])))
-            break
-    # Extended flag: prefer point sources
-    for col in ['Xflg', 'ext_flg']:
-        if col in df.columns:
-            with np.errstate(invalid='ignore'):
-                mask &= (pd.to_numeric(df[col], errors='coerce').fillna(0) == 0)
-            break
-    kept = int(mask.sum())
-    _print_filter_counts('2MASS', total, kept)
-    return df.loc[mask].reset_index(drop=True)
-
-
-def filter_wise_quality(df: pd.DataFrame) -> pd.DataFrame:
-    total = len(df)
-    if total == 0:
-        _print_filter_counts('WISE', 0, 0)
-        return df
-    mask = pd.Series(True, index=df.index)
-    # Photometric quality: W1/W2 not upper limits
-    if 'ph_qual' in df.columns:
-        pq = df['ph_qual'].astype(str)
-        def ok_ph(s: str) -> bool:
-            s = s.strip()
-            if len(s) == 0:
-                return True
-            w1 = s[0] if len(s) >= 1 else 'U'
-            w2 = s[1] if len(s) >= 2 else 'U'
-            return (w1 in ('A','B','C')) and (w2 in ('A','B','C'))
-        mask &= pq.apply(ok_ph)
-    # Artifact flags: require '0' in W1/W2 if ccf is present
-    for col in ['ccf', 'cc_flags', 'ccflag']:
-        if col in df.columns:
-            cf = df[col].astype(str)
-            def ok_cc(s: str) -> bool:
-                s = s.strip()
-                if len(s) == 0:
-                    return True
-                w1 = s[0] if len(s) >= 1 else '0'
-                w2 = s[1] if len(s) >= 2 else '0'
-                return (w1 == '0') and (w2 == '0')
-            mask &= cf.apply(ok_cc)
-            break
-    # Extended flag: prefer point sources
-    if 'ext_flg' in df.columns:
-        with np.errstate(invalid='ignore'):
-            mask &= (pd.to_numeric(df['ext_flg'], errors='coerce').fillna(0) == 0)
-    kept = int(mask.sum())
-    _print_filter_counts('WISE', total, kept)
-    return df.loc[mask].reset_index(drop=True)
-
-
-def filter_chandra_quality(df: pd.DataFrame) -> pd.DataFrame:
-    total = len(df)
-    if total == 0:
-        _print_filter_counts('Chandra', 0, 0)
-        return df
-    mask = pd.Series(True, index=df.index)
-    # Minimal sanity filters: finite coordinates and positive positional error
-    with np.errstate(invalid='ignore'):
-        mask &= df['ra_deg'].notna() & df['dec_deg'].notna()
-        if 'errMaj' in df.columns:
-            mask &= (pd.to_numeric(df['errMaj'], errors='coerce') > 0)
-    kept = int(mask.sum())
-    _print_filter_counts('Chandra', total, kept)
-    return df.loc[mask].reset_index(drop=True)
-
-
-def filter_xmm_quality(df: pd.DataFrame) -> pd.DataFrame:
-    total = len(df)
-    if total == 0:
-        _print_filter_counts('XMM', 0, 0)
-        return df
-    mask = pd.Series(True, index=df.index)
-    # Minimal sanity filters: finite coordinates and positive positional error
-    with np.errstate(invalid='ignore'):
-        mask &= df['ra_deg'].notna() & df['dec_deg'].notna()
-        if 'errMaj' in df.columns:
-            mask &= (pd.to_numeric(df['errMaj'], errors='coerce') > 0)
-    kept = int(mask.sum())
-    _print_filter_counts('XMM', total, kept)
-    return df.loc[mask].reset_index(drop=True)
-
-
-def query_chandra_csv(center: SkyCoord, radius: u.Quantity, csv_path: str) -> pd.DataFrame:
-    """Load Chandra sources from a pre-exported CSV and filter to cone.
-
-    The CSV is expected to provide at least: ra_deg, dec_deg, and an ID
-    column (pub_n or chandra_id). Positional error column (epos or
-    errMaj/errMin) is optional; defaults to 1.0 arcsec if missing.
-    """
-    if not csv_path:
-        raise ValueError("CSV path is empty; use --chandra-csv-path to provide a file.")
-    df_raw = pd.read_csv(csv_path)
-    # Normalize columns
-    def pick(*names):
-        for n in names:
-            if n in df_raw.columns:
-                return n
-        return None
-    ra_col = pick('ra_deg','RA_deg','RA')
-    dec_col = pick('dec_deg','DEC_deg','Dec')
-    if ra_col is None or dec_col is None:
-        raise KeyError(f"CSV must contain 'ra_deg' and 'dec_deg' columns; has {list(df_raw.columns)}")
-    id_col = pick('chandra_id','pub_n','id','srcid','num')
-    if id_col is None:
-        raise KeyError("CSV must contain an identifier column (e.g., 'pub_n' or 'chandra_id').")
-    err_col = pick('epos','errMaj','err_arcsec')
-
-    ra = pd.to_numeric(df_raw[ra_col], errors='coerce')
-    dec = pd.to_numeric(df_raw[dec_col], errors='coerce')
-    cid = df_raw[id_col]
-    if err_col is not None:
-        err = pd.to_numeric(df_raw[err_col], errors='coerce').fillna(1.0)
-    else:
-        err = pd.Series(1.0, index=df_raw.index)
-    df_full = pd.DataFrame({
-        'ra_deg': ra,
-        'dec_deg': dec,
-        'errMaj': err,
-        'errMin': err,
-        'errPA':  0.0,
-        'chandra_id': cid
-    }).dropna(subset=['ra_deg','dec_deg'])
-
-    # Filter spatially
-    coords = SkyCoord(ra=df_full['ra_deg'].values * u.deg,
-                      dec=df_full['dec_deg'].values * u.deg, frame='icrs')
-    sep = coords.separation(center)
-    mask = sep <= radius
-    df = df_full.loc[mask].reset_index(drop=True)
-    # Write cache consistent with other queries
-    cache_file = os.path.join(
-        CACHE_DIR,
-        f"Chandra_RA{center.ra.deg:.4f}_DEC{center.dec.deg:.4f}_R{radius.value:.4f}.csv"
-    )
-    df.to_csv(cache_file, index=False)
-    return df
 
 
 def cross_match(source_df: pd.DataFrame,
@@ -1799,7 +1419,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
 # Modify main() to return combined_df and catalogs for interactive use
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build NGC2264 multi-wavelength catalog")
-    parser.add_argument('-r', '--refresh', action='store_true', default=True,
+    parser.add_argument('-r', '--refresh', action='store_true', default=False,
                         help='Re-download all catalogs, ignoring cache')
     parser.add_argument('--pdf', action='store_true', default=True,
                         help='Generate PDF of match ellipses per catalog')
@@ -1807,14 +1427,6 @@ def main() -> None:
                         help="Panels per PDF page as CxR, e.g. '3x2' for 3 columns × 2 rows")
     parser.add_argument('--invert-cmap', action='store_true', default=True,
                         help='Invert grayscale colormap for background images (2MASS J)')
-    parser.add_argument('--chandra-source', choices=['idl','vizier','csv'], default='idl',
-                        help='Source for Chandra catalog: local IDL save, pre-exported CSV, or online VizieR')
-    parser.add_argument('--chandra-idl-path', default='/Users/ettoref/ASTRONOMY/DATA/N2264_XMM_alt/N2264.save',
-                        help='Path to local IDL save file containing N2264_acis12')
-    parser.add_argument('--chandra-idl-backend', choices=['auto','idlpy','scipy'], default='auto',
-                        help='Backend to read IDL save: NV5 idlpy bridge or SciPy readsav')
-    parser.add_argument('--chandra-csv-path', default='',
-                        help='Path to pre-exported Chandra CSV with columns ra_deg,dec_deg,epos/pub_n')
     args, _ = parser.parse_known_args()
     global REFRESH
     REFRESH = args.refresh
@@ -1841,44 +1453,23 @@ def main() -> None:
 
     print("Querying Gaia DR3 ...")
     gaia = query_gaia(center, radius)
-    print(f"Retrieved {len(gaia)} Gaia sources (raw)")
-    gaia = filter_gaia_quality(gaia)
+    print(f"Retrieved {len(gaia)} Gaia sources")
 
     print("Querying 2MASS ...")
     tmass = query_2mass(center, radius)
-    print(f"Retrieved {len(tmass)} 2MASS sources (raw)")
-    tmass = filter_2mass_quality(tmass)
+    print(f"Retrieved {len(tmass)} 2MASS sources")
 
     print("Querying WISE ...")
     wise = query_wise(center, radius)
-    print(f"Retrieved {len(wise)} WISE sources (raw)")
-    wise = filter_wise_quality(wise)
+    print(f"Retrieved {len(wise)} WISE sources")
 
     print("Querying Chandra ...")
-    if args.chandra_source == 'idl':
-        try:
-            chan = query_chandra_idl(center, radius, save_path=args.chandra_idl_path,
-                                     backend=args.chandra_idl_backend)
-        except Exception as e:
-            print(f"[warn] IDL-based Chandra load failed: {e}")
-            print("Falling back to VizieR for Chandra …")
-            chan = query_chandra(center, radius)
-    elif args.chandra_source == 'csv':
-        try:
-            chan = query_chandra_csv(center, radius, csv_path=args.chandra_csv_path)
-        except Exception as e:
-            print(f"[warn] CSV-based Chandra load failed: {e}")
-            print("Falling back to VizieR for Chandra …")
-            chan = query_chandra(center, radius)
-    else:
-        chan = query_chandra(center, radius)
-    print(f"Retrieved {len(chan)} Chandra sources (raw)")
-    chan = filter_chandra_quality(chan)
+    chan = query_chandra(center, radius)
+    print(f"Retrieved {len(chan)} Chandra sources")
 
     print("Querying XMM‑Newton ...")
     xmm = query_xmm(center, radius)
-    print(f"Retrieved {len(xmm)} XMM sources (raw)")
-    xmm = filter_xmm_quality(xmm)
+    print(f"Retrieved {len(xmm)} XMM sources")
 
     # Build master catalog cumulatively by matching and appending
     combined_df = gaia.copy()
