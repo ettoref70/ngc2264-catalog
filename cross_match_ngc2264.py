@@ -60,24 +60,7 @@ try:
     from astropy.coordinates import SkyCoord
     import astropy.units as u
     import pandas as pd
-    try:
-        from scipy.io import readsav  # optional, for IDL .sav files
-    except Exception:
-        readsav = None
-    # Optional NV5 IDL Python bridge
-    try:
-        # Attempt import directly
-        from idlpy import IDL as IDLBridge  # type: ignore
-    except Exception:
-        # Try common installation path
-        try:
-            import sys as _sys
-            _bridge_dir = '/Applications/NV5/idl/lib/bridges'
-            if os.path.isdir(_bridge_dir) and _bridge_dir not in _sys.path:
-                _sys.path.append(_bridge_dir)
-            from idlpy import IDL as IDLBridge  # type: ignore
-        except Exception:
-            IDLBridge = None
+    # No IDL .sav reading: we rely on a pre-exported CSV for Chandra
 except ImportError as exc:
     print("Missing required packages: {}".format(exc))
     print("Install dependencies with: pip install astropy astroquery pandas")
@@ -129,6 +112,7 @@ def query_gaia(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     rad_deg = radius.to(u.deg).value
     adql = f"""
     SELECT ra, dec, ra_error, dec_error, ra_dec_corr,
+           pmra, pmdec, pmra_error, pmdec_error, ref_epoch,
            source_id, phot_g_mean_mag, ruwe
       FROM gaiadr3.gaia_source
      WHERE CONTAINS(
@@ -142,6 +126,7 @@ def query_gaia(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     df = results.to_pandas()[[
         'ra', 'dec',
         'ra_error', 'dec_error', 'ra_dec_corr',
+        'pmra', 'pmdec', 'pmra_error', 'pmdec_error', 'ref_epoch',
         'source_id', 'phot_g_mean_mag', 'ruwe'
     ]]
     # Rename and cast Gaia ID to integer
@@ -151,6 +136,11 @@ def query_gaia(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
         'ra_error': 'ra_err_mas',
         'dec_error': 'dec_err_mas',
         'ra_dec_corr': 'ra_dec_corr',
+        'pmra': 'pmra',
+        'pmdec': 'pmdec',
+        'pmra_error': 'pmra_error',
+        'pmdec_error': 'pmdec_error',
+        'ref_epoch': 'ref_epoch',
         'source_id': 'gaia_id',
         'phot_g_mean_mag': 'Gmag',
         'ruwe': 'ruwe'
@@ -214,7 +204,7 @@ def query_2mass(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
             'errMaj', 'errMin', 'errPA',
             'Jmag', 'Hmag', 'Kmag', '2MASS',
             # Common 2MASS quality/contamination flags (if available)
-            'Qflg', 'Cflg', 'Xflg', 'prox'
+            'Qflg', 'Cflg', 'Xflg', 'prox', 'bl_flg'
         ],
         catalog='II/246', row_limit=-1
     )
@@ -376,160 +366,6 @@ def query_chandra(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     ]]
 
 
-def query_chandra_idl(center: SkyCoord, radius: u.Quantity,
-                      save_path: str = "/Users/ettoref/ASTRONOMY/DATA/N2264_XMM_alt/N2264.save",
-                      struct_name: str = "N2264_acis12",
-                      backend: str | None = None) -> pd.DataFrame:
-    """Load Chandra ACIS sources from a local IDL .sav file.
-
-    Expects a structure named `N2264_acis12` with at least RA/Dec and a
-    sequential identifier in the tag `pub_n`. RA/Dec may be provided as
-    degrees or sexagesimal strings. A positional error column (e.g.,
-    `epos`) will be used if present; otherwise a default of 1.0 arcsec is
-    assigned. The function filters the full table to the cone defined by
-    (center, radius) and returns a DataFrame with standard columns.
-    """
-    # Use cached CSV if available and refresh is false
-    cache_file = os.path.join(
-        CACHE_DIR,
-        f"Chandra_RA{center.ra.deg:.4f}_DEC{center.dec.deg:.4f}_R{radius.value:.4f}.csv"
-    )
-    refresh = globals().get("REFRESH", False)
-    if (not refresh) and os.path.exists(cache_file):
-        try:
-            return pd.read_csv(cache_file)
-        except Exception:
-            pass
-    # Decide backend: 'idlpy', 'scipy', or 'auto'
-    method = (backend or os.environ.get('CHANDRA_IDL_BACKEND', 'auto')).lower()
-    used_backend = None
-    arr = None
-    # Prefer IDL bridge if available and requested/auto
-    if (method in ('idlpy', 'auto')) and ('IDLBridge' in globals()) and (IDLBridge is not None):
-        try:
-            print(f"[Chandra IDL] using idlpy backend; restoring '{save_path}' …", flush=True)
-            IDLBridge.run(f'RESTORE, "{save_path}", /V')
-            # Fetch structure by name
-            arr = getattr(IDLBridge, struct_name)
-            used_backend = 'idlpy'
-        except Exception as e:
-            print(f"[Chandra IDL] idlpy backend failed: {e}", flush=True)
-            arr = None
-    # Fallback to SciPy readsav
-    if arr is None:
-        if readsav is None:
-            raise RuntimeError("scipy is required to read IDL .sav files (pip install scipy).")
-        uncomp_path = os.path.join(CACHE_DIR, "N2264_uncompressed.sav")
-        print(f"[Chandra IDL] using scipy readsav; reading '{save_path}' …", flush=True)
-        t0 = time.time()
-        try:
-            try:
-                sav = readsav(save_path, python_dict=True, uncompressed_file_name=uncomp_path, verbose=True)
-            except TypeError:
-                sav = readsav(save_path, verbose=True)
-        except Exception as e:
-            raise RuntimeError(f"Failed to read IDL save file '{save_path}': {e}")
-        print(f"[Chandra IDL] read complete in {time.time()-t0:.1f}s", flush=True)
-        # Locate the structure key case-insensitively
-        key = None
-        for k in sav.keys():
-            if str(k).lower() == struct_name.lower():
-                key = k
-                break
-        if key is None:
-            raise KeyError(f"Structure '{struct_name}' not found in '{save_path}'. Available: {list(sav.keys())}")
-        arr = sav[key]
-        used_backend = 'scipy'
-    # Normalize to a numpy structured array if coming from idlpy
-    try:
-        np_arr = np.array(arr)
-    except Exception:
-        np_arr = arr
-    # Access dtype names if it's a structured array
-    if not hasattr(np_arr, 'dtype') or not hasattr(np_arr.dtype, 'names') or np_arr.dtype.names is None:
-        raise TypeError(f"Unexpected type for '{struct_name}' (backend={used_backend}): {type(arr)}")
-    fields = list(np_arr.dtype.names)
-
-    def find_field(candidates):
-        for c in candidates:
-            for f in fields:
-                if f.lower() == c.lower():
-                    return f
-        return None
-
-    # Identify RA/Dec columns across common naming
-    ra_field = find_field(['ra_deg', 'ra', 'ra2000', 'raj2000', 'ra_icrs'])
-    dec_field = find_field(['dec_deg', 'dec', 'de2000', 'dej2000', 'dec_icrs', 'de'])
-    if ra_field is None or dec_field is None:
-        raise KeyError(f"Could not find RA/Dec columns in '{struct_name}'. Fields: {fields}")
-    ra_col = np_arr[ra_field]
-    dec_col = np_arr[dec_field]
-
-    # Convert RA/Dec to degrees regardless of input representation
-    def _to_deg(ra_vals, dec_vals):
-        # Flatten one-level arrays of shape (N,) or (N,1)
-        def _flat(x):
-            x = np.array(x)
-            return x.reshape(-1) if x.ndim > 1 else x
-        ra_v = _flat(ra_vals)
-        dec_v = _flat(dec_vals)
-        # If numeric, assume degrees
-        if np.issubdtype(ra_v.dtype, np.number) and np.issubdtype(dec_v.dtype, np.number):
-            return ra_v.astype(float), dec_v.astype(float)
-        # Otherwise, parse strings (bytes→str)
-        ra_s = [rv.decode('utf-8') if isinstance(rv, (bytes, np.bytes_)) else str(rv) for rv in ra_v]
-        dec_s = [dv.decode('utf-8') if isinstance(dv, (bytes, np.bytes_)) else str(dv) for dv in dec_v]
-        try:
-            coords = SkyCoord(ra_s, dec_s, unit=(u.hourangle, u.deg), frame='icrs')
-            return coords.ra.deg, coords.dec.deg
-        except Exception:
-            # Try both as degrees
-            coords = SkyCoord(ra_s, dec_s, unit=(u.deg, u.deg), frame='icrs')
-            return coords.ra.deg, coords.dec.deg
-
-    ra_deg, dec_deg = _to_deg(ra_col, dec_col)
-
-    # Positional error (arcsec) if available
-    err_field = find_field(['epos', 'pos_err', 'errpos', 'rpos'])
-    if err_field is not None:
-        err_arcsec = np.array(np_arr[err_field]).reshape(-1)
-        try:
-            err_arcsec = err_arcsec.astype(float)
-        except Exception:
-            err_arcsec = np.full_like(ra_deg, 1.0, dtype=float)
-    else:
-        err_arcsec = np.full_like(ra_deg, 1.0, dtype=float)
-
-    # Sequential identifier
-    id_field = find_field(['pub_n', 'id', 'srcid', 'num'])
-    if id_field is None:
-        raise KeyError("Could not find 'pub_n' (or fallback id) in the Chandra IDL structure")
-    chandra_id = np.array(np_arr[id_field]).reshape(-1)
-    try:
-        chandra_id = chandra_id.astype(int)
-    except Exception:
-        # If it's bytes/str, keep as string
-        chandra_id = chandra_id.astype(str)
-
-    df_full = pd.DataFrame({
-        'ra_deg': ra_deg,
-        'dec_deg': dec_deg,
-        'errMaj': err_arcsec,
-        'errMin': err_arcsec,
-        'errPA':  np.zeros_like(ra_deg, dtype=float),
-        'chandra_id': chandra_id,
-    })
-
-    # Spatial filter to (center, radius)
-    coords = SkyCoord(ra=df_full['ra_deg'].values * u.deg,
-                      dec=df_full['dec_deg'].values * u.deg, frame='icrs')
-    sep = coords.separation(center)
-    mask = sep <= radius
-    df = df_full.loc[mask].reset_index(drop=True)
-
-    # Cache to CSV consistent with other catalogs
-    df.to_csv(cache_file, index=False)
-    return df
 
 
 def query_xmm(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
@@ -769,6 +605,139 @@ def query_chandra_csv(center: SkyCoord, radius: u.Quantity, csv_path: str) -> pd
     return df
 
 
+# -------------------- Blend-aware association for 2MASS --------------------
+def attach_2mass_blends(combined_df: pd.DataFrame,
+                        tmass_df: pd.DataFrame,
+                        *,
+                        r_group_arcsec: float = 1.5,
+                        max_pair_sep_arcsec: float = 2.0,
+                        r_centroid_arcsec: float = 0.5,
+                        max_dG_mag: float = 1.0,
+                        prefer_blflag: bool = True) -> pd.DataFrame:
+    """Attach a single 2MASS source to a compact group of Gaia stars (blend).
+
+    The normal D²≤1 matching remains untouched. This pass only handles
+    2MASS sources that remain unmatched after the standard merge, by
+    identifying nearby compact groups of Gaia stars consistent with an
+    unresolved blend in 2MASS.
+
+    Criteria (low‑spurious):
+      - at least two Gaia within ``r_group_arcsec`` of the 2MASS pos
+      - pairwise Gaia separations ≤ ``max_pair_sep_arcsec``
+      - 2MASS vs Gaia centroid distance ≤ ``r_centroid_arcsec``
+      - optional brightness similarity: ΔG ≤ ``max_dG_mag``
+      - if ``prefer_blflag`` and 2MASS has ``bl_flg>0``, treat as strong evidence
+    """
+    if combined_df.empty or tmass_df.empty or 'gaia_id' not in combined_df.columns:
+        return combined_df
+
+    # Only consider Gaia master rows (exclude synthetic rows)
+    is_gaia = (~combined_df['gaia_id'].isna()) & (combined_df['gaia_id'] != -1)
+    if not np.any(is_gaia):
+        return combined_df
+    gaia = combined_df.loc[is_gaia, ['ra_deg', 'dec_deg', 'Gmag', 'gaia_id']].copy()
+    gaia.rename(columns={'ra_deg': 'ra', 'dec_deg': 'dec'}, inplace=True)
+
+    # Consider as already-attached only 2MASS IDs that are linked to at least
+    # one VALID Gaia master row (gaia_id != -1). Synthetic rows should not block.
+    if '2MASS' in combined_df.columns:
+        attached_ids = set(
+            str(x) for x in combined_df.loc[is_gaia, '2MASS'].dropna().astype(str).values
+        )
+    else:
+        attached_ids = set()
+
+    def _deg_to_arcsec(dx_deg, dy_deg, dec0_deg):
+        return (dx_deg * np.cos(np.deg2rad(dec0_deg)) * 3600.0,
+                dy_deg * 3600.0)
+
+    for _, tm in tmass_df.iterrows():
+        tm_id = str(tm.get('2MASS'))
+        if tm_id in attached_ids:
+            continue
+        ra0 = float(tm['ra_deg']); dec0 = float(tm['dec_deg'])
+
+        # Geometry around this 2MASS source
+        dx_as, dy_as = _deg_to_arcsec(gaia['ra'].values - ra0, gaia['dec'].values - dec0, dec0)
+        sep_as = np.hypot(dx_as, dy_as)
+        cand = np.where(sep_as <= r_group_arcsec)[0]
+        if len(cand) < 2:
+            continue
+
+        # Pairwise compactness
+        ok_pairs = True
+        idxs = cand.tolist()
+        for i in range(len(idxs)):
+            for j in range(i + 1, len(idxs)):
+                a = gaia.iloc[idxs[i]]; b = gaia.iloc[idxs[j]]
+                dxa, dya = _deg_to_arcsec(float(a['ra'] - b['ra']), float(a['dec'] - b['dec']), dec0)
+                if np.hypot(dxa, dya) > max_pair_sep_arcsec:
+                    ok_pairs = False
+                    break
+            if not ok_pairs:
+                break
+        if not ok_pairs:
+            continue
+
+        # Centroid proximity
+        ra_c = float(np.mean(gaia.iloc[idxs]['ra'].values))
+        dec_c = float(np.mean(gaia.iloc[idxs]['dec'].values))
+        dx_c_as, dy_c_as = _deg_to_arcsec(ra_c - ra0, dec_c - dec0, dec0)
+        if np.hypot(dx_c_as, dy_c_as) > r_centroid_arcsec:
+            continue
+
+        # Brightness similarity (optional)
+        gvals = gaia.iloc[idxs]['Gmag'].values
+        if np.nanmax(gvals) - np.nanmin(gvals) > max_dG_mag:
+            continue
+
+        # Prefer 2MASS blend flag when available
+        if prefer_blflag and ('bl_flg' in tmass_df.columns):
+            try:
+                blv = int(tm.get('bl_flg')) if not pd.isna(tm.get('bl_flg')) else 0
+            except Exception:
+                blv = 0
+            # If explicitly non-blended and we already have strict geometry, we can still attach; else proceed
+            # No hard rejection here; the geometry acts as the main guardrail.
+            pass
+
+        # Attach to all Gaia members in the group
+        gaia_ids = [int(g) for g in gaia.iloc[idxs]['gaia_id'].values]
+        for gid in gaia_ids:
+            mask = combined_df['gaia_id'] == gid
+            combined_df.loc[mask, '2MASS'] = tm.get('2MASS')
+            combined_df.loc[mask, 'blend_2mass'] = True
+            combined_df.loc[mask, 'blend_n_2mass'] = len(gaia_ids)
+            combined_df.loc[mask, 'blend_members_2mass'] = ';'.join(str(x) for x in gaia_ids)
+        attached_ids.add(tm_id)
+
+    return combined_df
+
+
+def _dedupe_unmatched_for_id(combined_df: pd.DataFrame, id_col: str) -> pd.DataFrame:
+    """Remove synthetic rows (gaia_id == -1) for a given catalog id when
+    the same id is already attached to at least one valid Gaia row.
+
+    This prevents duplicate entries like one row with GAIA='—' and another
+    with a GAIA match for the same catalog identifier (e.g., 2MASS).
+    """
+    if id_col not in combined_df.columns or 'gaia_id' not in combined_df.columns:
+        return combined_df
+    try:
+        mask_valid = (~combined_df['gaia_id'].isna()) & (combined_df['gaia_id'] != -1)
+        ids_with_valid = set(combined_df.loc[mask_valid, id_col].dropna().astype(str).values)
+        drop_mask = (~mask_valid) & (combined_df[id_col].astype(str).isin(ids_with_valid))
+        n_before = len(combined_df)
+        if drop_mask.any():
+            combined_df = combined_df.loc[~drop_mask].reset_index(drop=True)
+            n_removed = n_before - len(combined_df)
+            if n_removed > 0:
+                print(f"[dedupe] removed {n_removed} synthetic rows for {id_col}")
+    except Exception:
+        pass
+    return combined_df
+
+
 def cross_match(source_df: pd.DataFrame,
                 other_df: pd.DataFrame,
                 other_id_col: str,
@@ -826,7 +795,69 @@ def cross_match(source_df: pd.DataFrame,
     # via small–angle approximations in Cartesian space.  They have been
     # removed to avoid unnecessary overhead.
 
-    # Precompute 2x2 covariance matrices for source objects
+    # Helper to extract per-row target epoch (Julian year) for the secondary catalog.
+    def _epoch_of_row(j: int) -> Optional[float]:
+        meta = None
+        if isinstance(all_catalogs, dict):
+            meta = all_catalogs.get(other_id_col.replace('_id', ''), {})
+        # Candidate numeric columns
+        candidates = [
+            'ref_epoch', 'epoch', 'EPOCH', 'Epoch',
+            'MJD', 'mjd', 'JD', 'jd',
+            'w1mjdmean', 'w2mjdmean', 'w3mjdmean', 'w4mjdmean'
+        ]
+        row = other_df.iloc[j]
+        # Try direct year first
+        for c in ['ref_epoch', 'epoch', 'EPOCH', 'Epoch']:
+            if c in other_df.columns:
+                try:
+                    val = float(row[c])
+                    if not np.isnan(val):
+                        return val
+                except Exception:
+                    pass
+        # Try MJD/averaged WISE MJDs
+        mjds = []
+        for c in ['MJD', 'mjd', 'w1mjdmean', 'w2mjdmean', 'w3mjdmean', 'w4mjdmean']:
+            if c in other_df.columns:
+                try:
+                    v = float(row[c])
+                    if not np.isnan(v) and v > 0:
+                        mjds.append(v)
+                except Exception:
+                    pass
+        if mjds:
+            mjd = float(np.nanmean(mjds))
+            # Convert MJD to Julian year (approx)
+            return 2000.0 + (mjd - 51544.5) / 365.25
+        # Try JD
+        for c in ['JD', 'jd']:
+            if c in other_df.columns:
+                try:
+                    jd = float(row[c])
+                    if not np.isnan(jd) and jd > 0:
+                        return 2000.0 + (jd - 2451545.0) / 365.25
+                except Exception:
+                    pass
+        # Try ISO date strings
+        for c in ['date', 'dateobs', 'obs_date']:
+            if c in other_df.columns:
+                try:
+                    from datetime import datetime
+                    s = str(row[c])
+                    dt = datetime.fromisoformat(s)
+                    year_start = datetime(dt.year, 1, 1)
+                    doy = (dt - year_start).days + 0.5
+                    return dt.year + doy / 365.25
+                except Exception:
+                    pass
+        # Fallback to catalog-level epoch if provided
+        try:
+            return float(meta.get('epoch')) if meta and (meta.get('epoch') is not None) else None
+        except Exception:
+            return None
+
+    # Precompute 2x2 positional covariance matrices for source objects (no PM inflation here)
     # Apply scale factor to ellipse axes before converting to degrees
     min_deg = min_radius.to(u.deg).value
     src_maj = np.maximum((source_df['errMaj'] * scale_factor).values / 3600.0, min_deg)  # deg
@@ -834,6 +865,10 @@ def cross_match(source_df: pd.DataFrame,
     src_pa  = np.deg2rad(source_df['errPA'].values)  # radians
     n_src = len(source_df)
     src_cov = np.zeros((n_src, 2, 2))
+    # Gather per-row proper motion and uncertainties if available
+    has_pm = ('pmra' in source_df.columns) and ('pmdec' in source_df.columns)
+    has_pm_err = ('pmra_error' in source_df.columns) and ('pmdec_error' in source_df.columns)
+    has_epoch = ('ref_epoch' in source_df.columns)
     for i in range(n_src):
         a = src_maj[i]
         b = src_min[i]
@@ -844,7 +879,8 @@ def cross_match(source_df: pd.DataFrame,
         vmaj = np.array([sphi, cphi])
         # Minor axis unit vector: (-cos(PA), sin(PA))
         vmin = np.array([-cphi, sphi])
-        src_cov[i] = a*a * np.outer(vmaj, vmaj) + b*b * np.outer(vmin, vmin)
+        cov = a*a * np.outer(vmaj, vmaj) + b*b * np.outer(vmin, vmin)
+        src_cov[i] = cov
 
     # Precompute 2x2 covariance matrices for other objects
     oth_maj = np.maximum((other_df['errMaj'] * scale_factor).values / 3600.0, min_deg)  # deg
@@ -870,10 +906,52 @@ def cross_match(source_df: pd.DataFrame,
         dra  = (other_df['ra_deg'].values - ra0) * np.cos(dec0)
         ddec = other_df['dec_deg'].values - source_df.iloc[i]['dec_deg']
 
+        # Apply proper-motion shift of the source position to the per-row target epoch (if available)
+        dx_pm = 0.0
+        dy_pm = 0.0
+        epoch_j = _epoch_of_row(j)
+        if (epoch_j is not None) and has_pm and has_epoch:
+            try:
+                ref_ep = float(source_df.iloc[i]['ref_epoch'])
+            except Exception:
+                ref_ep = None
+            if ref_ep is not None and not np.isnan(ref_ep):
+                dt = float(epoch_j - ref_ep)
+                try:
+                    pmra_val = float(source_df.iloc[i]['pmra'])
+                except Exception:
+                    pmra_val = 0.0
+                try:
+                    pmdec_val = float(source_df.iloc[i]['pmdec'])
+                except Exception:
+                    pmdec_val = 0.0
+                # pmra is mu_alpha* (RA*cosDec) in mas/yr; convert to deg shift along RA* axis
+                dx_pm = (pmra_val / 1000.0 / 3600.0) * dt
+                dy_pm = (pmdec_val / 1000.0 / 3600.0) * dt
+
         ids = []
         for j in range(len(other_df)):
             # Combined covariance matrix
             C = src_cov[i] + oth_cov[j]
+            # Add PM-uncertainty inflation for the baseline to this row's epoch
+            if (epoch_j is not None) and has_pm_err and has_epoch:
+                try:
+                    ref_ep = float(source_df.iloc[i]['ref_epoch'])
+                except Exception:
+                    ref_ep = None
+                if ref_ep is not None and not np.isnan(ref_ep):
+                    dt = float(epoch_j - ref_ep)
+                    try:
+                        pmra_e = float(source_df.iloc[i]['pmra_error'])
+                    except Exception:
+                        pmra_e = 0.0
+                    try:
+                        pmdec_e = float(source_df.iloc[i]['pmdec_error'])
+                    except Exception:
+                        pmdec_e = 0.0
+                    sig_ra_deg = abs(pmra_e) / 1000.0 / 3600.0 * abs(dt)
+                    sig_de_deg = abs(pmdec_e) / 1000.0 / 3600.0 * abs(dt)
+                    C = C + np.diag([sig_ra_deg**2, sig_de_deg**2])
             # Invert covariance, with fallback regularization if singular
             try:
                 invC = la.inv(C)
@@ -884,7 +962,8 @@ def cross_match(source_df: pd.DataFrame,
                 except la.LinAlgError:
                     # Skip this pair if still singular
                     continue
-            vec = np.array([dra[j], ddec[j]])
+            # Subtract the source PM shift so comparison is at the catalog row's epoch
+            vec = np.array([dra[j] - dx_pm, ddec[j] - dy_pm])
             # Mahalanobis squared distance
             D2 = vec.dot(invC).dot(vec)
             # Only match if within 1-sigma ellipse
@@ -1147,6 +1226,7 @@ def fetch_2mass_j_image(center: 'SkyCoord', width_deg: float, height_deg: float)
       - 'auto'     : try SkyView, then fall back to HiPS on failure (default)
       - 'hips'     : use HiPS directly (skip SkyView)
       - 'skyview'  : use SkyView only (no fallback)
+      - 'off'      : disable image download entirely (no background)
 
     Returns (data, WCS) or (None, None) on failure.
     """
@@ -1211,6 +1291,8 @@ def fetch_2mass_j_image(center: 'SkyCoord', width_deg: float, height_deg: float)
         return None, None
 
     # If user forces HiPS, go straight there
+    if mode == 'off':
+        return None, None
     if mode == 'hips':
         return _fetch_via_hips()
 
@@ -1312,7 +1394,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
                      plot_mode: str = 'match',
                      ncols: int = 2,
                      nrows: int = 2,
-                     invert_cmap: bool = False) -> None:
+                     invert_cmap: bool = False,
+                     draw_images: bool = True) -> None:
     key = id_col.replace('_id', '')
     params = all_catalogs.get(key, {}) if isinstance(all_catalogs, dict) else {}
     factor = float(params.get('factor', 1.0))
@@ -1326,6 +1409,71 @@ def plot_after_merge(combined_df: pd.DataFrame,
         'xmm':     '#9467bd',  # purple
     }
     cur_color = CAT_COLORS.get(key, '#17becf')  # color for the current (new) catalog
+
+    # Helpers for epochs and PM-inflated ellipse drawing
+    def _epoch_from_row(row) -> Optional[float]:
+        for c in ['ref_epoch','epoch','EPOCH','Epoch']:
+            if c in other_df.columns:
+                try:
+                    v = float(row[c])
+                    if not np.isnan(v):
+                        return v
+                except Exception:
+                    pass
+        mjds = []
+        for c in ['MJD','mjd','w1mjdmean','w2mjdmean','w3mjdmean','w4mjdmean']:
+            if c in other_df.columns:
+                try:
+                    v = float(row[c])
+                    if not np.isnan(v) and v > 0:
+                        mjds.append(v)
+                except Exception:
+                    pass
+        if mjds:
+            mjd = float(np.nanmean(mjds))
+            return 2000.0 + (mjd - 51544.5) / 365.25
+        for c in ['JD','jd']:
+            if c in other_df.columns:
+                try:
+                    jd = float(row[c])
+                    if not np.isnan(jd) and jd > 0:
+                        return 2000.0 + (jd - 2451545.0) / 365.25
+                except Exception:
+                    pass
+        for c in ['date','dateobs','obs_date']:
+            if c in other_df.columns:
+                try:
+                    from datetime import datetime
+                    s = str(row[c])
+                    dt = datetime.fromisoformat(s)
+                    year_start = datetime(dt.year, 1, 1)
+                    doy = (dt - year_start).days + 0.5
+                    return dt.year + doy/365.25
+                except Exception:
+                    pass
+        meta = all_catalogs.get(key, {}) if isinstance(all_catalogs, dict) else {}
+        try:
+            return float(meta.get('epoch')) if meta and (meta.get('epoch') is not None) else None
+        except Exception:
+            return None
+
+    def _cov_from_axes_arcsec(maj_as, min_as, pa_deg):
+        phi = np.deg2rad(pa_deg)
+        sphi, cphi = np.sin(phi), np.cos(phi)
+        vmaj = np.array([sphi, cphi])
+        vmin = np.array([-cphi, sphi])
+        return (maj_as*maj_as) * np.outer(vmaj, vmaj) + (min_as*min_as) * np.outer(vmin, vmin)
+
+    def _ellipse_from_cov_arcsec(C):
+        vals, vecs = np.linalg.eigh(C)
+        order = np.argsort(vals)[::-1]
+        vals = vals[order]
+        vecs = vecs[:, order]
+        maj = float(np.sqrt(max(vals[0], 0.0)))
+        min_ = float(np.sqrt(max(vals[1], 0.0)))
+        v = vecs[:, 0]
+        pa = float((np.degrees(np.arctan2(v[0], v[1])) % 360.0))
+        return maj, min_, pa
 
     # Build short-id maps from all catalogs
     index_maps: dict[str, dict] = {}
@@ -1383,6 +1531,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
             new_id = other_df.iloc[j][id_col]
             ra0 = other_df.iloc[j]['ra_deg']
             dec0 = other_df.iloc[j]['dec_deg']
+            epoch_row = _epoch_from_row(other_df.iloc[j])
 
             # Offsets for background
             dx_oth = (other_df['ra_deg'] - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
@@ -1404,13 +1553,15 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 nearest_sep_arcsec = float(np.min(dist_all))
             else:
                 nearest_sep_arcsec = None
+            # PM-corrected closest separation (computed later when we know Δt); used for title display
+            closest_sep_pm_arcsec = None
 
             # Determine plotting margin in arcsec
             margin = max(oth_maj_plot[j], oth_min_plot[j]) * 2.0
             margin = max(margin, 5.0)  # at least ±2.5" half-width
 
-            # If this is a 2MASS panel, draw a 2MASS J-band background aligned via WCS
-            if key == '2MASS':
+            # If this is a 2MASS panel and allowed, draw a 2MASS J-band background aligned via WCS
+            if draw_images and key == '2MASS':
                 center_icrs = SkyCoord(ra=ra0 * u.deg, dec=dec0 * u.deg, frame='icrs')
                 fov_deg = (2.0 * margin) / 3600.0  # full width/height in degrees
                 data_img, wcs_img = fetch_2mass_j_image(center_icrs, fov_deg, fov_deg)
@@ -1483,6 +1634,21 @@ def plot_after_merge(combined_df: pd.DataFrame,
             # Collect candidate master rows within the plotted area; per-catalog plotting happens below
             cand_indices = [int(m) for m in range(len(combined_df))
                             if abs(dx_src.iloc[m]) <= margin and abs(dy_src.iloc[m]) <= margin]
+            # Suppress synthetic self-row (current catalog id with gaia_id == -1) from the table
+            if (id_col in combined_df.columns) and ('gaia_id' in combined_df.columns):
+                _new_id_str = str(new_id)
+                filtered = []
+                for m in cand_indices:
+                    try:
+                        same_id = (str(combined_df.iloc[m][id_col]) == _new_id_str)
+                    except Exception:
+                        same_id = False
+                    is_synth = (pd.isna(combined_df.iloc[m].get('gaia_id', np.nan))
+                                or combined_df.iloc[m].get('gaia_id', -1) == -1)
+                    if same_id and is_synth:
+                        continue
+                    filtered.append(m)
+                cand_indices = filtered
 
             # Overlay the specific new source
             e0 = Ellipse((0, 0),
@@ -1558,10 +1724,35 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                             angle=crow['errPA'], edgecolor=CAT_COLORS.get(kcat, 'red'), linestyle='-',
                                             linewidth=lw, fill=False, label=None)
                             ax.add_patch(ell_m)
-                            # Emphasize matched GAIA position with a colored plus
+                            # Emphasize matched GAIA position with a colored plus + PM arrow/inflated ellipse
                             if kcat == 'gaia':
                                 ax.plot(dxm, dym, marker='+', color=CAT_COLORS['gaia'],
                                         markersize=7, markeredgewidth=1.2, linestyle='None')
+                                # If epoch is known and PM available, draw arrow and PM-inflated ellipse
+                                try:
+                                    if (epoch_row is not None
+                                        and ('pmra' in crow.index) and ('pmdec' in crow.index)
+                                        and ('pmra_error' in crow.index) and ('pmdec_error' in crow.index)
+                                        and ('ref_epoch' in crow.index)):
+                                        dt = float(epoch_row - float(crow['ref_epoch']))
+                                        pm_dx = float(crow['pmra']) * 0.001 * dt   # arcsec along RA*
+                                        pm_dy = float(crow['pmdec']) * 0.001 * dt  # arcsec Dec
+                                        if np.hypot(pm_dx, pm_dy) > 0.05:
+                                            ax.arrow(dxm, dym, pm_dx, pm_dy, width=0.0, head_width=0.03,
+                                                     head_length=0.05, length_includes_head=True,
+                                                     color=CAT_COLORS['gaia'], alpha=0.9)
+                                        # PM-uncertainty inflation
+                                        sig_ra = abs(float(crow['pmra_error'])) * 0.001 * abs(dt)
+                                        sig_de = abs(float(crow['pmdec_error'])) * 0.001 * abs(dt)
+                                        Cpos = _cov_from_axes_arcsec(_maj_m, _min_m, float(crow['errPA']))
+                                        Cinf = Cpos + np.diag([sig_ra**2, sig_de**2])
+                                        maj_i, min_i, pa_i = _ellipse_from_cov_arcsec(Cinf)
+                                        ell_pm = Ellipse((dxm, dym), width=2*maj_i, height=2*min_i,
+                                                         angle=pa_i, edgecolor=CAT_COLORS['gaia'], linestyle='--',
+                                                         linewidth=1.2, fill=False, alpha=0.9)
+                                        ax.add_patch(ell_pm)
+                                except Exception:
+                                    pass
                             drawn_components.add((kcat, lookup_key))
 
             # Background: draw components for UNMATCHED master rows in lighter/transparent colors
@@ -1627,6 +1818,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
 
             best_sep = None
             best_d2 = None
+            best_dt = None
+            nearest_d2 = None
+            nearest_dt = None
             if master_indices:
                 # Keep only real master rows (with a Gaia id), excluding synthetic rows created from the new catalog
                 if 'gaia_id' in combined_df.columns:
@@ -1638,9 +1832,27 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 if master_valid:
                     Cnew = _cov_from_axes(oth_maj_plot[j], oth_min_plot[j], float(other_df.iloc[j]['errPA']))
                     for m in master_valid:
-                        vec = np.array([float(dx_src.iloc[m]), float(dy_src.iloc[m])])  # arcsec
+                        # PM-corrected residual vector Gaia→catalog row (arcsec)
+                        pm_dx = 0.0; pm_dy = 0.0
+                        if (epoch_row is not None) and ('pmra' in combined_df.columns) and ('pmdec' in combined_df.columns) and ('ref_epoch' in combined_df.columns):
+                            try:
+                                ref_ep = float(combined_df.iloc[m]['ref_epoch'])
+                                dt_tmp = float(epoch_row - ref_ep)
+                                pm_dx = float(combined_df.iloc[m]['pmra']) * 0.001 * dt_tmp
+                                pm_dy = float(combined_df.iloc[m]['pmdec']) * 0.001 * dt_tmp
+                            except Exception:
+                                pm_dx = 0.0; pm_dy = 0.0
+                        vec = np.array([float(dx_src.iloc[m]) + pm_dx, float(dy_src.iloc[m]) + pm_dy])
                         mrow = combined_df.iloc[m]
                         Cmas = _cov_from_axes(float(mrow['errMaj']), float(mrow['errMin']), float(mrow['errPA']))
+                        # PM-uncertainty inflation for this candidate baseline
+                        if (epoch_row is not None) and ('pmra_error' in combined_df.columns) and ('pmdec_error' in combined_df.columns) and ('ref_epoch' in combined_df.columns):
+                            try:
+                                sig_ra = abs(float(mrow['pmra_error'])) * 0.001 * abs(dt_tmp)
+                                sig_de = abs(float(mrow['pmdec_error'])) * 0.001 * abs(dt_tmp)
+                                Cmas = Cmas + np.diag([sig_ra**2, sig_de**2])
+                            except Exception:
+                                pass
                         Csum = Cnew + Cmas
                         try:
                             invC = la.inv(Csum)
@@ -1650,6 +1862,107 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         sep = float(np.hypot(*vec))
                         if best_d2 is None or d2 < best_d2:
                             best_d2, best_sep = d2, sep
+                            if epoch_row is not None and ('ref_epoch' in combined_df.columns):
+                                try:
+                                    best_dt = float(epoch_row - float(mrow['ref_epoch']))
+                                except Exception:
+                                    best_dt = None
+                else:
+                    # There is a synthetic self-row but no valid Gaia master: compute D² to the nearest valid master
+                    if 'gaia_id' in combined_df.columns:
+                        valid_master_mask = (~combined_df['gaia_id'].isna()) & (combined_df['gaia_id'] != -1)
+                    else:
+                        valid_master_mask = np.ones(len(combined_df), dtype=bool)
+                    try:
+                        not_self_mask = combined_df[id_col].astype(str) != str(new_id)
+                    except Exception:
+                        not_self_mask = np.ones(len(combined_df), dtype=bool)
+                    nearest_mask = valid_master_mask & not_self_mask
+                    if np.any(nearest_mask):
+                        idxs = np.where(nearest_mask)[0]
+                        dist_all = np.hypot(dx_src.iloc[idxs].values, dy_src.iloc[idxs].values)
+                        k = int(np.argmin(dist_all))
+                        mnear = int(idxs[k])
+                        Cnew = _cov_from_axes(oth_maj_plot[j], oth_min_plot[j], float(other_df.iloc[j]['errPA']))
+                        mrow = combined_df.iloc[mnear]
+                        Cmas = _cov_from_axes(float(mrow['errMaj']), float(mrow['errMin']), float(mrow['errPA']))
+                        if (epoch_row is not None) and ('pmra_error' in combined_df.columns) and ('pmdec_error' in combined_df.columns) and ('ref_epoch' in combined_df.columns):
+                            try:
+                                ref_ep = float(mrow['ref_epoch']); dt_tmp = float(epoch_row - ref_ep)
+                                sig_ra = abs(float(mrow['pmra_error'])) * 0.001 * abs(dt_tmp)
+                                sig_de = abs(float(mrow['pmdec_error'])) * 0.001 * abs(dt_tmp)
+                                Cmas = Cmas + np.diag([sig_ra**2, sig_de**2])
+                            except Exception:
+                                pass
+                        Csum = Cnew + Cmas
+                        try:
+                            invC = la.inv(Csum)
+                        except la.LinAlgError:
+                            invC = la.inv(Csum + np.eye(2) * 1e-6)
+                        # PM-corrected residual vector to this nearest master
+                        pm_dx = 0.0; pm_dy = 0.0
+                        if (epoch_row is not None) and ('pmra' in combined_df.columns) and ('pmdec' in combined_df.columns) and ('ref_epoch' in combined_df.columns):
+                            try:
+                                ref_ep = float(mrow['ref_epoch']); dt_tmp = float(epoch_row - ref_ep)
+                                pm_dx = float(mrow['pmra']) * 0.001 * dt_tmp
+                                pm_dy = float(mrow['pmdec']) * 0.001 * dt_tmp
+                            except Exception:
+                                pm_dx = 0.0; pm_dy = 0.0
+                        vec = np.array([float(dx_src.iloc[mnear]) + pm_dx, float(dy_src.iloc[mnear]) + pm_dy])
+                        nearest_d2 = float(vec.dot(invC).dot(vec))
+                        closest_sep_pm_arcsec = float(np.hypot(*vec))
+                        try:
+                            nearest_dt = float(epoch_row - float(mrow['ref_epoch'])) if (epoch_row is not None) else None
+                        except Exception:
+                            nearest_dt = None
+            else:
+                # No master rows with the same id at all: compute D² to the nearest valid master by angular separation
+                if 'gaia_id' in combined_df.columns:
+                    valid_master_mask = (~combined_df['gaia_id'].isna()) & (combined_df['gaia_id'] != -1)
+                else:
+                    valid_master_mask = np.ones(len(combined_df), dtype=bool)
+                try:
+                    not_self_mask = combined_df[id_col].astype(str) != str(new_id)
+                except Exception:
+                    not_self_mask = np.ones(len(combined_df), dtype=bool)
+                nearest_mask = valid_master_mask & not_self_mask
+                if np.any(nearest_mask):
+                    idxs = np.where(nearest_mask)[0]
+                    dist_all = np.hypot(dx_src.iloc[idxs].values, dy_src.iloc[idxs].values)
+                    k = int(np.argmin(dist_all))
+                    mnear = int(idxs[k])
+                    Cnew = _cov_from_axes(oth_maj_plot[j], oth_min_plot[j], float(other_df.iloc[j]['errPA']))
+                    mrow = combined_df.iloc[mnear]
+                    Cmas = _cov_from_axes(float(mrow['errMaj']), float(mrow['errMin']), float(mrow['errPA']))
+                    if (epoch_row is not None) and ('pmra_error' in combined_df.columns) and ('pmdec_error' in combined_df.columns) and ('ref_epoch' in combined_df.columns):
+                        try:
+                            ref_ep = float(mrow['ref_epoch']); dt_tmp = float(epoch_row - ref_ep)
+                            sig_ra = abs(float(mrow['pmra_error'])) * 0.001 * abs(dt_tmp)
+                            sig_de = abs(float(mrow['pmdec_error'])) * 0.001 * abs(dt_tmp)
+                            Cmas = Cmas + np.diag([sig_ra**2, sig_de**2])
+                        except Exception:
+                            pass
+                    Csum = Cnew + Cmas
+                    try:
+                        invC = la.inv(Csum)
+                    except la.LinAlgError:
+                        invC = la.inv(Csum + np.eye(2) * 1e-6)
+                    # PM-corrected residual vector to this nearest master
+                    pm_dx = 0.0; pm_dy = 0.0
+                    if (epoch_row is not None) and ('pmra' in combined_df.columns) and ('pmdec' in combined_df.columns) and ('ref_epoch' in combined_df.columns):
+                        try:
+                            ref_ep = float(mrow['ref_epoch']); dt_tmp = float(epoch_row - ref_ep)
+                            pm_dx = float(mrow['pmra']) * 0.001 * dt_tmp
+                            pm_dy = float(mrow['pmdec']) * 0.001 * dt_tmp
+                        except Exception:
+                            pm_dx = 0.0; pm_dy = 0.0
+                    vec = np.array([float(dx_src.iloc[mnear]) + pm_dx, float(dy_src.iloc[mnear]) + pm_dy])
+                    nearest_d2 = float(vec.dot(invC).dot(vec))
+                    closest_sep_pm_arcsec = float(np.hypot(*vec))
+                    try:
+                        nearest_dt = float(epoch_row - float(mrow['ref_epoch'])) if (epoch_row is not None) else None
+                    except Exception:
+                        nearest_dt = None
 
             # === Dynamic association table across available catalogs (exclude current catalog) ===
             # Determine which catalogs to include based on the candidate rows; exclude current catalog `key`
@@ -1684,12 +1997,33 @@ def plot_after_merge(combined_df: pd.DataFrame,
             def _fmt(val):
                 return str(val) if val is not None else '—'
 
-            headers = [k.upper() for k in display_cats]
+            # Build table columns and headers; if GAIA is present, add a Gmag column right after it
+            col_keys = list(display_cats)
+            add_gmag = ('gaia' in display_cats) and ('Gmag' in combined_df.columns)
+            if add_gmag:
+                gi = col_keys.index('gaia')
+                col_keys.insert(gi + 1, 'gaia_g')  # synthetic key for Gmag display
+            headers = [
+                ('G' if k == 'gaia_g' else k.upper())
+                for k in col_keys
+            ]
             raw_rows = []  # list of (cells_list, is_matched)
             for m, _dist in cand_with_dist:
                 mrow = combined_df.iloc[m]
                 cells = []
-                for kcat in display_cats:
+                for kcat in col_keys:
+                    if kcat == 'gaia_g':
+                        # Show Gaia G magnitude next to the GAIA id
+                        if ('gaia_id' in combined_df.columns and not _is_missing(mrow.get('gaia_id', None))
+                                and ('Gmag' in combined_df.columns) and pd.notna(mrow.get('Gmag', np.nan))):
+                            try:
+                                gval = float(mrow['Gmag'])
+                                cells.append(f"{gval:.2f}")
+                            except Exception:
+                                cells.append(_fmt(None))
+                        else:
+                            cells.append(_fmt(None))
+                        continue
                     colname = col_for[kcat]
                     if colname in combined_df.columns and not _is_missing(mrow.get(colname, None)):
                         cells.append(_fmt(_short_of(kcat, mrow[colname])))
@@ -1738,9 +2072,11 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 # Draw header per column with catalog colors (no separator line)
                 for i, head in enumerate(headers):
                     trans = offset_copy(ax.transAxes, fig=fig, x=x_offsets[i], y=0, units='points')
+                    key_i = col_keys[i]
+                    key_color = CAT_COLORS.get('gaia' if key_i == 'gaia_g' else key_i, 'black')
                     ax.text(0.05, y0, head, transform=trans,
                             va='top', ha='left', family='monospace', fontsize=font_size,
-                            fontweight='bold', color=CAT_COLORS.get(display_cats[i], 'black'))
+                            fontweight='bold', color=key_color)
 
                 # Draw rows per column, color-coded and bold if matched; add '✓ ' on matched rows
                 for r_idx, (cells, is_matched) in enumerate(rows_limited):
@@ -1751,10 +2087,12 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             prefix = '✓ ' if is_matched else '  '
                             text_cell = prefix + text_cell
                         trans = offset_copy(ax.transAxes, fig=fig, x=x_offsets[i], y=0, units='points')
+                        key_i = col_keys[i]
+                        key_color = CAT_COLORS.get('gaia' if key_i == 'gaia_g' else key_i, 'black')
                         ax.text(0.05, y, text_cell.ljust(col_w[i]), transform=trans,
                                 va='top', ha='left', family='monospace', fontsize=font_size,
                                 fontweight=('bold' if is_matched else 'normal'),
-                                color=CAT_COLORS.get(display_cats[i], 'black'))
+                                color=key_color)
 
                 # If there are more rows than fit, add a small ellipsis line
                 if len(rows_limited) < len(raw_rows):
@@ -1767,12 +2105,33 @@ def plot_after_merge(combined_df: pd.DataFrame,
             # Title with short id for the current catalog + compact diagnostics
             short_new = _short_of(key, new_id)
             title = f"{key} #{short_new}" if short_new is not None else f"{key}"
+            # Mark potential blends when multiple valid Gaia masters share this 2MASS id
+            if key == '2MASS' and 'gaia_id' in combined_df.columns:
+                try:
+                    same_id_mask = (combined_df[id_col].astype(str) == str(new_id))
+                except Exception:
+                    same_id_mask = np.zeros(len(combined_df), dtype=bool)
+                if np.any(same_id_mask):
+                    valid_gaia = same_id_mask & (~combined_df['gaia_id'].isna()) & (combined_df['gaia_id'] != -1)
+                    if int(np.sum(valid_gaia)) >= 2:
+                        title += " — blend"
             if (best_sep is not None) and (best_d2 is not None):
                 # Use Unicode double-prime for arcsec and superscript 2 for D²
                 title += f" — sep={best_sep:.2f}″, D²={best_d2:.2f}"
-            elif nearest_sep_arcsec is not None:
+                if best_dt is not None:
+                    title += f", Δt={best_dt:.1f}y"
+            elif (nearest_sep_arcsec is not None) or (closest_sep_pm_arcsec is not None):
                 # No matches: report separation to the closest master source
-                title += f" — closest={nearest_sep_arcsec:.2f}″"
+                if nearest_d2 is not None:
+                    sep_to_show = (closest_sep_pm_arcsec
+                                   if closest_sep_pm_arcsec is not None else nearest_sep_arcsec)
+                    title += f" — closest={sep_to_show:.2f}″, D²={nearest_d2:.2f}"
+                    if nearest_dt is not None:
+                        title += f", Δt={nearest_dt:.1f}y"
+                else:
+                    sep_to_show = (closest_sep_pm_arcsec
+                                   if closest_sep_pm_arcsec is not None else nearest_sep_arcsec)
+                    title += f" — closest={sep_to_show:.2f}″"
             ax.set_title(title, pad=10)
 
             ax.set_xlim(-margin, margin)
@@ -1799,7 +2158,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
 # Modify main() to return combined_df and catalogs for interactive use
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build NGC2264 multi-wavelength catalog")
-    parser.add_argument('-r', '--refresh', action='store_true', default=True,
+    parser.add_argument('-r', '--refresh', action='store_true', default=False,
                         help='Re-download all catalogs, ignoring cache')
     parser.add_argument('--pdf', action='store_true', default=True,
                         help='Generate PDF of match ellipses per catalog')
@@ -1807,13 +2166,9 @@ def main() -> None:
                         help="Panels per PDF page as CxR, e.g. '3x2' for 3 columns × 2 rows")
     parser.add_argument('--invert-cmap', action='store_true', default=True,
                         help='Invert grayscale colormap for background images (2MASS J)')
-    parser.add_argument('--chandra-source', choices=['idl','vizier','csv'], default='idl',
-                        help='Source for Chandra catalog: local IDL save, pre-exported CSV, or online VizieR')
-    parser.add_argument('--chandra-idl-path', default='/Users/ettoref/ASTRONOMY/DATA/N2264_XMM_alt/N2264.save',
-                        help='Path to local IDL save file containing N2264_acis12')
-    parser.add_argument('--chandra-idl-backend', choices=['auto','idlpy','scipy'], default='auto',
-                        help='Backend to read IDL save: NV5 idlpy bridge or SciPy readsav')
-    parser.add_argument('--chandra-csv-path', default='',
+    parser.add_argument('--no-images', action='store_true', default=False,
+                        help='Skip downloading 2MASS J images in PDFs (faster, avoids network stalls)')
+    parser.add_argument('--chandra-csv-path', default='/Users/ettoref/ASTRONOMY/DATA/N2264_XMM_alt/N2264_acis12.csv',
                         help='Path to pre-exported Chandra CSV with columns ra_deg,dec_deg,epos/pub_n')
     args, _ = parser.parse_known_args()
     global REFRESH
@@ -1829,15 +2184,15 @@ def main() -> None:
     INVERT_CMAP = args.invert_cmap
     # Per-catalog parameters: factor and min_radius (arcsec)
     catalog_params = {
-        'gaia':    {'factor': 2.0, 'min_radius': 0.05},
-        '2MASS':   {'factor': 2.0, 'min_radius': 0.10},
-        'wise':    {'factor': 2.0, 'min_radius': 1.00},
-        'chandra': {'factor': 2.0, 'min_radius': 5.00},
-        'xmm':     {'factor': 2.0, 'min_radius': 5.00}
+        'gaia':    {'factor': 2.0, 'min_radius': 0.05, 'epoch': 2016.0},
+        '2MASS':   {'factor': 2.0, 'min_radius': 0.10, 'epoch': 2000.0},
+        'wise':    {'factor': 2.0, 'min_radius': 1.00, 'epoch': 2010.5},
+        'chandra': {'factor': 2.0, 'min_radius': 5.00, 'epoch': 2002.0},
+        'xmm':     {'factor': 2.0, 'min_radius': 5.00, 'epoch': 2003.0}
     }
     # Define the central coordinate of NGC 2264 and search radius
     center = SkyCoord(ra=100.25 * u.deg, dec=9.883333 * u.deg, frame='icrs')
-    radius = 0.02 * u.deg
+    radius = 0.1 * u.deg
 
     print("Querying Gaia DR3 ...")
     gaia = query_gaia(center, radius)
@@ -1854,24 +2209,11 @@ def main() -> None:
     print(f"Retrieved {len(wise)} WISE sources (raw)")
     wise = filter_wise_quality(wise)
 
-    print("Querying Chandra ...")
-    if args.chandra_source == 'idl':
-        try:
-            chan = query_chandra_idl(center, radius, save_path=args.chandra_idl_path,
-                                     backend=args.chandra_idl_backend)
-        except Exception as e:
-            print(f"[warn] IDL-based Chandra load failed: {e}")
-            print("Falling back to VizieR for Chandra …")
-            chan = query_chandra(center, radius)
-    elif args.chandra_source == 'csv':
-        try:
-            chan = query_chandra_csv(center, radius, csv_path=args.chandra_csv_path)
-        except Exception as e:
-            print(f"[warn] CSV-based Chandra load failed: {e}")
-            print("Falling back to VizieR for Chandra …")
-            chan = query_chandra(center, radius)
-    else:
-        chan = query_chandra(center, radius)
+    print("Querying Chandra from CSV ...")
+    try:
+        chan = query_chandra_csv(center, radius, csv_path=args.chandra_csv_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load Chandra CSV ('{args.chandra_csv_path}'): {e}")
     print(f"Retrieved {len(chan)} Chandra sources (raw)")
     chan = filter_chandra_quality(chan)
 
@@ -1893,7 +2235,8 @@ def main() -> None:
     catalogs: dict[str, object] = {}
     # Save Gaia catalog (indexed by gaia_id) as DataFrame with factor and min_radius
     catalogs['gaia'] = {
-        'data': gaia.set_index('gaia_id')[['ra_deg','dec_deg','errMaj','errMin','errPA']],
+        'data': gaia.set_index('gaia_id')[['ra_deg','dec_deg','errMaj','errMin','errPA',
+                                           'pmra','pmdec','pmra_error','pmdec_error','ref_epoch']],
         **catalog_params['gaia']
     }
 
@@ -2030,6 +2373,19 @@ def main() -> None:
         # Append all new rows to the existing combined_df
         if rows_to_append:
             combined_df = pd.concat([combined_df, pd.DataFrame(rows_to_append)], ignore_index=True)
+        # For 2MASS, add a blend-aware association pass (no radius inflation)
+        if id_col == '2MASS':
+            combined_df = attach_2mass_blends(
+                combined_df,
+                df_other,
+                r_group_arcsec=1.5,
+                max_pair_sep_arcsec=2.0,
+                r_centroid_arcsec=0.7,
+                max_dG_mag=2.0,
+                prefer_blflag=True
+            )
+            # Remove synthetic rows for this 2MASS id when a valid Gaia link exists
+            combined_df = _dedupe_unmatched_for_id(combined_df, id_col)
         # Generate post-merge plots so panels reflect final combined_df
         if args.pdf:
             plot_after_merge(
@@ -2041,7 +2397,8 @@ def main() -> None:
                 plot_mode='match',
                 ncols=GRID_COLS,
                 nrows=GRID_ROWS,
-                invert_cmap=INVERT_CMAP
+                invert_cmap=INVERT_CMAP,
+                draw_images=(not args.no_images)
             )
     # Keep only coordinate, error ellipse, and identification columns in the final catalog
     # id_columns = [
