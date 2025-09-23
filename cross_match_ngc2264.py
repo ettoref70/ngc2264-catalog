@@ -60,6 +60,11 @@ try:
     from astropy.coordinates import SkyCoord
     import astropy.units as u
     import pandas as pd
+    # Optional SAMP support (Aladin Desktop)
+    try:
+        from astropy.samp import SAMPIntegratedClient  # type: ignore
+    except Exception:
+        SAMPIntegratedClient = None
     # No IDL .sav reading: we rely on a pre-exported CSV for Chandra
 except ImportError as exc:
     print("Missing required packages: {}".format(exc))
@@ -105,6 +110,14 @@ def query_gaia(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
     if not refresh and os.path.exists(cache_file):
         # Read Gaia cache, ensuring gaia_id is int64
         df = pd.read_csv(cache_file, dtype={'gaia_id': 'int64'})
+        # Backward compatibility: older caches may lack PM columns; add safe defaults
+        for col, default in (
+            ('pmra', 0.0), ('pmdec', 0.0),
+            ('pmra_error', 0.0), ('pmdec_error', 0.0),
+            ('ref_epoch', 2016.0),
+        ):
+            if col not in df.columns:
+                df[col] = default
         return df
     # Use ADQL query to explicitly fetch ra_dec_corr
     ra_center = center.ra.deg
@@ -1064,6 +1077,7 @@ def cross_match(source_df: pd.DataFrame,
             for ax in axes_flat[len(indices):]:
                 fig.delaxes(ax)
             # Plot each source in this page
+            hidden_texts = []
             for ax_idx, j in enumerate(indices):
                 ax = axes_flat[ax_idx]
                 # Reference position
@@ -1395,7 +1409,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
                      ncols: int = 2,
                      nrows: int = 2,
                      invert_cmap: bool = False,
-                     draw_images: bool = True) -> None:
+                     draw_images: bool = True,
+                     aladin_dir: str | None = None,
+                     samp_enabled: bool = False,
+                     samp_addr: str | None = None) -> None:
     key = id_col.replace('_id', '')
     params = all_catalogs.get(key, {}) if isinstance(all_catalogs, dict) else {}
     factor = float(params.get('factor', 1.0))
@@ -1409,6 +1426,51 @@ def plot_after_merge(combined_df: pd.DataFrame,
         'xmm':     '#9467bd',  # purple
     }
     cur_color = CAT_COLORS.get(key, '#17becf')  # color for the current (new) catalog
+
+    # Avoid pyplot figure warning for many pages
+    try:
+        import matplotlib as _mpl
+        _mpl.rcParams['figure.max_open_warning'] = 0
+    except Exception:
+        pass
+
+    # Optional: establish SAMP connection once per figure to talk to Aladin Desktop
+    samp_client = None
+    samp_aladin_cids: list[str] = []
+    if samp_enabled and ('SAMPIntegratedClient' in globals()) and (SAMPIntegratedClient is not None):
+        try:
+            if samp_addr:
+                samp_client = SAMPIntegratedClient(name="NGC2264-Matcher", addr=samp_addr)
+            else:
+                samp_client = SAMPIntegratedClient(name="NGC2264-Matcher")
+            # Bind to loopback to avoid OS routing issues
+            try:
+                samp_client.connect()
+            except Exception:
+                # Retry on IPv6 loopback
+                samp_client = SAMPIntegratedClient(name="NGC2264-Matcher", addr="::1")
+                samp_client.connect()
+            # Discover Aladin-like clients
+            for cid in samp_client.get_registered_clients():
+                try:
+                    meta = samp_client.get_metadata(cid)
+                    name = ' '.join([str(meta.get(k, '')) for k in ('samp.name','application.name','author')]).lower()
+                    if ('aladin' in name) or ('cds' in name):
+                        samp_aladin_cids.append(cid)
+                except Exception:
+                    continue
+            # Keep logs terse: only report once per call
+            if not samp_aladin_cids:
+                print('[SAMP] Warning: hub connected but no Aladin client found')
+        except Exception as e:
+            # Degrade quietly when SAMP is unavailable
+            print(f"[SAMP] Connection failed: {e}")
+            samp_client = None
+
+    # Collect entries for an HTML index with per-panel links
+    index_rows: list[dict] = []
+    # Collect per-page HTML outputs
+    page_files: list[str] = []
 
     # Helpers for epochs and PM-inflated ellipse drawing
     def _epoch_from_row(row) -> Optional[float]:
@@ -1510,6 +1572,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
     pdf = PdfPages(pdf_path) if pdf_path else None
     per_page = ncols * nrows
     total = len(other_df)
+    import math as _math
+    total_pages = max(1, _math.ceil(total / max(1, per_page)))
 
     # Precompute new-catalog ellipse axes for plotting
     if plot_mode == 'match':
@@ -1526,6 +1590,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
         axes_flat = np.atleast_1d(axes).ravel()
         for ax in axes_flat[len(indices):]:
             fig.delaxes(ax)
+        # Collect clickable areas for this page (axes positions and links)
+        page_areas: list[dict] = []
         for ax_idx, j in enumerate(indices):
             ax = axes_flat[ax_idx]
             new_id = other_df.iloc[j][id_col]
@@ -2148,11 +2214,704 @@ def plot_after_merge(combined_df: pd.DataFrame,
             # Master positions
             legend_handles.append(Line2D([], [], color='gray', marker='+', linestyle='None', label='master pos'))
             ax.legend(handles=legend_handles, loc='lower right', fontsize='small', framealpha=0.9)
+
+            # Add a clickable link to open the same view in Aladin (Lite link),
+            # and optionally write a Desktop Aladin script + region file with a file:// link
+            try:
+                from urllib.parse import quote_plus
+                # Center and FOV in degrees consistent with this panel
+                fov_deg = (2.0 * margin) / 3600.0
+                target = f"{ra0:.7f} {dec0:.7f}"
+                # Choose a survey close to the current catalog for visual consistency
+                survey_map = {
+                    '2MASS': 'P/2MASS/J',
+                    'wise': 'P/AllWISE/color',
+                    'gaia': 'P/DSS2/color',
+                    'chandra': 'P/DSS2/color',
+                    'xmm': 'P/DSS2/color',
+                }
+                survey = survey_map.get(key, 'P/DSS2/color')
+                url = (
+                    'https://aladin.u-strasbg.fr/AladinLite/?'
+                    f'target={quote_plus(target)}&fov={fov_deg:.6f}&survey={quote_plus(survey)}'
+                )
+                text_lite = ax.text(
+                    0.98, 0.98, 'Aladin Lite', transform=ax.transAxes,
+                    ha='right', va='top', fontsize=8, color='#1f77b4',
+                    url=url, zorder=10,
+                    bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#1f77b4', lw=0.8, alpha=0.95)
+                )
+                try:
+                    hidden_texts.append(text_lite)
+                except Exception:
+                    pass
+
+                # If a directory is provided, create an Aladin Desktop script (.ajs) and a DS9 region file
+                if aladin_dir:
+                    os.makedirs(aladin_dir, exist_ok=True)
+                    # Sanitize an id for filenames
+                    short_new = _short_of(key, new_id)
+                    tag = f"{key}_{short_new}" if short_new is not None else f"{key}"
+                    base = f"aladin_{tag}_c{start+ax_idx+1}"
+                    reg_path = os.path.abspath(os.path.join(aladin_dir, base + '.reg'))
+                    ajs_path = os.path.abspath(os.path.join(aladin_dir, base + '.ajs'))
+
+                    # Build a DS9 region content for the panel overlays (fk5)
+                    reg = []
+                    reg.append('fk5')
+                    # New catalog ellipse (match-mode scaled)
+                    reg.append(
+                        'ellipse(%.7f,%.7f,%.3f\",%.3f\",%.1f) # color=%s width=2' % (
+                            ra0, dec0, oth_maj_plot[j], oth_min_plot[j], float(other_df.iloc[j]['errPA']),
+                            'green'
+                        )
+                    )
+                    # Overlay Gaia and others in the panel area
+                    def add_point(r, d, color='blue', shape='cross', size=8):
+                        reg.append('point(%.7f,%.7f) # point=%s color=%s size=%d' % (r, d, shape, color, size))
+                    def add_line(r1, d1, r2, d2, color='blue'):
+                        reg.append('line(%.7f,%.7f,%.7f,%.7f) # color=%s' % (r1, d1, r2, d2, color))
+
+                    # Add Gaia points and PM arrows where available
+                    if 'gaia' in all_catalogs:
+                        gaia_df = all_catalogs['gaia']['data']
+                        # reuse cand_indices to restrict nearby content
+                        for m in cand_indices:
+                            if 'gaia_id' not in combined_df.columns:
+                                break
+                            if pd.isna(combined_df.iloc[m].get('gaia_id', np.nan)) or combined_df.iloc[m].get('gaia_id', -1) == -1:
+                                continue
+                            gid = combined_df.iloc[m]['gaia_id']
+                            if gid in gaia_df.index:
+                                grow = gaia_df.loc[gid]
+                                add_point(float(grow['ra_deg']), float(grow['dec_deg']), color='blue', shape='cross', size=8)
+                                # PM arrow if epoch known
+                                if epoch_row is not None and all(k in grow for k in ['pmra','pmdec','ref_epoch']):
+                                    try:
+                                        dt = float(epoch_row - float(grow['ref_epoch']))
+                                        dra_deg = (float(grow['pmra']) / 3600e3) * (1.0 / np.cos(np.deg2rad(float(grow['dec_deg'])))) * dt
+                                        ddec_deg = (float(grow['pmdec']) / 3600e3) * dt
+                                        add_line(float(grow['ra_deg']), float(grow['dec_deg']),
+                                                 float(grow['ra_deg']) + dra_deg, float(grow['dec_deg']) + ddec_deg,
+                                                 color='blue')
+                                    except Exception:
+                                        pass
+
+                    # Write region file
+                    with open(reg_path, 'w') as f:
+                        f.write('\n'.join(reg) + '\n')
+
+                    # Build a minimal Aladin script: load survey, center, fov, and the region overlay
+                    survey_aladin = {
+                        '2MASS': 'CDS/P/2MASS/J',
+                        'wise': 'CDS/P/AllWISE/Color',
+                    }.get(key, 'CDS/P/DSS2/color')
+                    fov_arcmin = fov_deg * 60.0
+                    ajs = [
+                        f'info "PDF script: {base}"',
+                        # Keep current background; just move and adjust FoV
+                        f'{ra0:.7f} {dec0:.7f}',
+                        f'zoom {fov_arcmin:.3f} arcmin',
+                    ]
+
+                    # Build colorized overlays via Aladin draw commands in separate planes
+                    # First, remove previous planes (if any) for idempotent refresh
+                    ajs.append('rm "aladin_*_ellipse"')
+                    ajs.append('rm "aladin_*_gaia"')
+                    ajs.append(f'rm "{base}_ellipse"')
+                    ajs.append(f'rm "{base}_gaia"')
+                    # Plane 1: ellipse for the new/other catalog source (green)
+                    ajs.append(f'draw newtool("{base}_ellipse")')
+                    ajs.append(
+                        'draw green ellipse(%.7f %.7f %.3farcsec %.3farcsec %.1f)'
+                        % (ra0, dec0, oth_maj_plot[j], oth_min_plot[j], float(other_df.iloc[j]['errPA']))
+                    )
+
+                    # Plane 2: Gaia candidates and proper motion arrows (blue)
+                    if 'gaia' in all_catalogs:
+                        ajs.append(f'draw newtool("{base}_gaia")')
+                        gaia_df = all_catalogs['gaia']['data']
+                        g_factor = float(all_catalogs['gaia'].get('factor', 1.0))
+                        g_minr   = float(all_catalogs['gaia'].get('min_radius', 0.0))
+                        for m in cand_indices:
+                            if 'gaia_id' not in combined_df.columns:
+                                break
+                            gid = combined_df.iloc[m].get('gaia_id', -1)
+                            if pd.isna(gid) or gid == -1:
+                                continue
+                            if gid in gaia_df.index:
+                                grow = gaia_df.loc[gid]
+                                try:
+                                    r_g = float(grow['ra_deg']); d_g = float(grow['dec_deg'])
+                                except Exception:
+                                    continue
+                                # Identification ellipse for Gaia, scaled as in the PDF panels
+                                try:
+                                    maj_g = max(float(grow['errMaj']) * g_factor, g_minr)
+                                    min_g = max(float(grow['errMin']) * g_factor, g_minr)
+                                    pa_g  = float(grow['errPA'])
+                                except Exception:
+                                    maj_g = float(grow.get('errMaj', 0.5))
+                                    min_g = float(grow.get('errMin', 0.5))
+                                    pa_g  = float(grow.get('errPA', 0.0))
+                                ajs.append('draw blue ellipse(%.7f %.7f %.3farcsec %.3farcsec %.1f)'
+                                           % (r_g, d_g, maj_g, min_g, pa_g))
+                                # PM arrow if epoch known
+                                if epoch_row is not None and all(k in grow for k in ['pmra','pmdec','ref_epoch']):
+                                    try:
+                                        dt = float(epoch_row - float(grow['ref_epoch']))
+                                        dra_deg = (float(grow['pmra']) / 3600e3) * (1.0 / max(1e-8, np.cos(np.deg2rad(d_g)))) * dt
+                                        ddec_deg = (float(grow['pmdec']) / 3600e3) * dt
+                                        ajs.append('draw blue line(%.7f %.7f %.7f %.7f)'
+                                                   % (r_g, d_g, r_g + dra_deg, d_g + ddec_deg))
+                                    except Exception:
+                                        pass
+                    with open(ajs_path, 'w') as f:
+                        f.write('\n'.join(ajs) + '\n')
+
+                    # Try to create a small launcher for Desktop Aladin, to avoid PDF/file association issues
+                    launcher_path = None
+                    launcher_open_path = None
+                    launcher_openfile_path = None
+                    launcher_samp_path = None
+                    launcher_samp_app_path = None
+                    # 1) Try JAR-based launcher
+                    try:
+                        jar_env = os.environ.get('ALADIN_JAR', '').strip()
+                        jar_candidates = [p for p in [jar_env] if p]
+                        # Common macOS bundle locations (newer and older)
+                        jar_candidates += [
+                            '/Applications/Aladin.app/Contents/app/Aladin.jar',
+                            '/Applications/Aladin.app/Contents/Java/Aladin.jar',
+                        ]
+                        jar_path = next((p for p in jar_candidates if os.path.exists(p)), '')
+                        if jar_path:
+                            if sys.platform.startswith('darwin') or sys.platform.startswith('linux'):
+                                ext = '.command' if sys.platform.startswith('darwin') else '.sh'
+                                launcher_path = os.path.abspath(os.path.join(aladin_dir, base + ext))
+                                script = [
+                                    '#!/usr/bin/env bash',
+                                    'set -euo pipefail',
+                                    f'JAR="{jar_path}"',
+                                    f'exec java ${ALADIN_JAVA_OPTS:-} -jar "$JAR" -script "{ajs_path}"'
+                                ]
+                                with open(launcher_path, 'w') as f:
+                                    f.write('\n'.join(script) + '\n')
+                                try:
+                                    os.chmod(launcher_path, 0o755)
+                                except Exception:
+                                    pass
+                                # Also create macOS launchers that target the running app via open -a
+                                if sys.platform.startswith('darwin'):
+                                    launcher_open_path = os.path.abspath(os.path.join(aladin_dir, base + '_open.command'))
+                                    aladin_app = os.environ.get('ALADIN_APP', '/Applications/Aladin.app')
+                                    script_open = [
+                                        '#!/usr/bin/env bash',
+                                        'set -euo pipefail',
+                                        f'APP="{aladin_app}"',
+                                        f'open -a "$APP" --args -script "{ajs_path}"',
+                                        'sleep 0.2 || true',
+                                        "osascript -e 'tell application \"Aladin\" to activate' || true",
+                                    ]
+                                    with open(launcher_open_path, 'w') as f:
+                                        f.write('\n'.join(script_open) + '\n')
+                                    try:
+                                        os.chmod(launcher_open_path, 0o755)
+                                    except Exception:
+                                        pass
+                                    # Alternative: pass the .ajs as a document (relies on .ajs association)
+                                    launcher_openfile_path = os.path.abspath(os.path.join(aladin_dir, base + '_openfile.command'))
+                                    script_openfile = [
+                                        '#!/usr/bin/env bash',
+                                        'set -euo pipefail',
+                                        f'APP="{aladin_app}"',
+                                        f'open -a "$APP" "{ajs_path}"',
+                                        'sleep 0.2 || true',
+                                        "osascript -e 'tell application \"Aladin\" to activate' || true",
+                                    ]
+                                    with open(launcher_openfile_path, 'w') as f:
+                                        f.write('\n'.join(script_openfile) + '\n')
+                                    try:
+                                        os.chmod(launcher_openfile_path, 0o755)
+                                    except Exception:
+                                        pass
+                            elif sys.platform.startswith('win'):
+                                ext = '.bat'
+                                launcher_path = os.path.abspath(os.path.join(aladin_dir, base + ext))
+                                script = [
+                                    '@echo off',
+                                    'setlocal',
+                                    f'set JAR={jar_path}',
+                                    f'java %ALADIN_JAVA_OPTS% -jar "%JAR%" -script "{ajs_path}"'
+                                ]
+                                with open(launcher_path, 'w') as f:
+                                    f.write('\r\n'.join(script) + '\r\n')
+                    except Exception:
+                        launcher_path = None
+
+                    # 2) macOS fallback: open -a Aladin.app
+                    if (launcher_path is None) and sys.platform.startswith('darwin'):
+                        try:
+                            ext = '.command'
+                            launcher_path = os.path.abspath(os.path.join(aladin_dir, base + ext))
+                            aladin_app = os.environ.get('ALADIN_APP', '/Applications/Aladin.app')
+                            script = [
+                                '#!/usr/bin/env bash',
+                                'set -euo pipefail',
+                                f'APP="{aladin_app}"',
+                                f'open -a "$APP" --args -script "{ajs_path}"',
+                                'sleep 0.2 || true',
+                                "osascript -e 'tell application \"Aladin\" to activate' || true",
+                            ]
+                            with open(launcher_path, 'w') as f:
+                                f.write('\n'.join(script) + '\n')
+                            try:
+                                os.chmod(launcher_path, 0o755)
+                            except Exception:
+                                pass
+                        except Exception:
+                            launcher_path = None
+
+                    # 3) SAMP launcher to drive the running Aladin instance (preferred for in-place control)
+                    try:
+                        samp_py = os.path.abspath(os.path.join(os.getcwd(), 'aladin_samp_test.py'))
+                        if os.path.exists(samp_py):
+                            if sys.platform.startswith('darwin') or sys.platform.startswith('linux'):
+                                ext = '.command' if sys.platform.startswith('darwin') else '.sh'
+                                launcher_samp_path = os.path.abspath(os.path.join(aladin_dir, base + '_samp' + ext))
+                                script = [
+                                    '#!/usr/bin/env bash',
+                                    'set -euo pipefail',
+                                    'PYTHON_BIN="${PYTHON:-python3}"',
+                                    'ADDR="${SAMP_ADDR:-127.0.0.1}"',
+                                    f'"$PYTHON_BIN" "{samp_py}" --mode script --send-ajs "{ajs_path}" --addr "$ADDR"',
+                                ]
+                                with open(launcher_samp_path, 'w') as f:
+                                    f.write('\n'.join(script) + '\n')
+                                try:
+                                    os.chmod(launcher_samp_path, 0o755)
+                                except Exception:
+                                    pass
+                                # On macOS, also try to generate a small AppleScript .app to avoid opening Terminal
+                                if sys.platform.startswith('darwin') and os.path.exists('/usr/bin/osacompile'):
+                                    try:
+                                        launcher_samp_app_path = os.path.abspath(os.path.join(aladin_dir, base + '_samp.app'))
+                                        applescript_src = os.path.abspath(os.path.join(aladin_dir, base + '_samp.applescript'))
+                                        pybin = os.environ.get('PYTHON', sys.executable if sys.executable else 'python3')
+                                        # Build a background shell command; escape quotes for AppleScript
+                                        cmd = f'{pybin} "{samp_py}" --mode script --send-ajs "{ajs_path}" --addr 127.0.0.1 >/dev/null 2>&1 &'
+                                        cmd_esc = cmd.replace('\\', '\\\\').replace('"', '\\"')
+                                        content = 'on run\n    do shell script "' + cmd_esc + '"\nend run\n'
+                                        with open(applescript_src, 'w') as f:
+                                            f.write(content)
+                                        # Compile AppleScript into an app bundle
+                                        os.system(f'/usr/bin/osacompile -o "{launcher_samp_app_path}" "{applescript_src}" >/dev/null 2>&1')
+                                        # Clean up source file if compile succeeded
+                                        if os.path.exists(launcher_samp_app_path):
+                                            try:
+                                                os.remove(applescript_src)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        launcher_samp_app_path = None
+                            elif sys.platform.startswith('win'):
+                                ext = '.bat'
+                                launcher_samp_path = os.path.abspath(os.path.join(aladin_dir, base + '_samp' + ext))
+                                script = [
+                                    '@echo off',
+                                    'setlocal',
+                                    'set PYTHON_BIN=%PYTHON%',
+                                    'if "%PYTHON_BIN%"=="" set PYTHON_BIN=python',
+                                    'set ADDR=%SAMP_ADDR%',
+                                    'if "%ADDR%"=="" set ADDR=127.0.0.1',
+                                    f'"%PYTHON_BIN%" "{samp_py}" --mode script --send-ajs "{ajs_path}" --addr "%ADDR%"'
+                                ]
+                                with open(launcher_samp_path, 'w') as f:
+                                    f.write('\r\n'.join(script) + '\r\n')
+                    except Exception:
+                        launcher_samp_path = None
+
+                    # Left-side button: keep only one SAMP link to control the running Aladin
+                    if launcher_samp_app_path and os.path.exists(launcher_samp_app_path):
+                        file_url = 'file://' + launcher_samp_app_path
+                        primary_label = 'Aladin'
+                    elif launcher_samp_path and os.path.exists(launcher_samp_path):
+                        file_url = 'file://' + launcher_samp_path
+                        primary_label = 'Aladin'
+                    else:
+                        file_url = 'file://' + os.path.abspath(aladin_dir)
+                        primary_label = 'Open Scripts Folder'
+                    text_aladin = ax.text(
+                        0.02, 0.98, primary_label, transform=ax.transAxes,
+                        ha='left', va='top', fontsize=8, color='#2ca02c',
+                        url=file_url, zorder=10,
+                        bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#2ca02c', lw=0.8, alpha=0.95)
+                    )
+                    try:
+                        hidden_texts.append(text_aladin)
+                    except Exception:
+                        pass
+
+                    # Save an entry for the HTML index
+                    try:
+                        index_rows.append({
+                            'base': base,
+                            'aladin': file_url,
+                            'lite': url,
+                        })
+                    except Exception:
+                        pass
+
+                    # Save area info for page-level HTML image map
+                    try:
+                        page_areas.append({
+                            'base': base,
+                            'ax_index': ax_idx,
+                            'aladin': file_url,
+                            'lite': url,
+                        })
+                    except Exception:
+                        pass
+
+                    # Also prepare a simple VOTable overlay and send via SAMP (safe, no scripts)
+                    if samp_client is not None and samp_aladin_cids:
+                        try:
+                            vot_path = os.path.abspath(os.path.join(aladin_dir, base + '.vot'))
+                            rows = [("new", f"{ra0:.7f}", f"{dec0:.7f}")]
+                            # Add visible Gaia candidates in the panel area
+                            if 'gaia' in all_catalogs and 'gaia_id' in combined_df.columns:
+                                for m in cand_indices:
+                                    gid = combined_df.iloc[m].get('gaia_id', -1)
+                                    if pd.isna(gid) or gid == -1:
+                                        continue
+                                    # skip duplicates of the same Gaia id
+                                    rows.append((f"gaia_{int(gid)}",
+                                                 f"{float(combined_df.iloc[m]['ra_deg']):.7f}",
+                                                 f"{float(combined_df.iloc[m]['dec_deg']):.7f}"))
+                            # Minimal VOTable
+                            vot = [
+                                "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+                                "<VOTABLE version=\"1.3\" xmlns=\"http://www.ivoa.net/xml/VOTable/v1.3\">",
+                                " <RESOURCE>",
+                                "  <TABLE>",
+                                "   <FIELD name=\"name\" datatype=\"char\" arraysize=\"*\"/>",
+                                "   <FIELD name=\"RAJ2000\" ucd=\"pos.eq.ra;meta.main\" unit=\"deg\" datatype=\"double\"/>",
+                                "   <FIELD name=\"DEJ2000\" ucd=\"pos.eq.dec;meta.main\" unit=\"deg\" datatype=\"double\"/>",
+                                "   <DATA>",
+                                "    <TABLEDATA>",
+                            ]
+                            # Limit duplicates by keeping order but unique names
+                            seen = set()
+                            for name, ra_s, de_s in rows:
+                                if name in seen:
+                                    continue
+                                vot.append(f"     <TR><TD>{name}</TD><TD>{ra_s}</TD><TD>{de_s}</TD></TR>")
+                                seen.add(name)
+                            vot += [
+                                "    </TABLEDATA>",
+                                "   </DATA>",
+                                "  </TABLE>",
+                                " </RESOURCE>",
+                                "</VOTABLE>",
+                            ]
+                            with open(vot_path, 'w') as f:
+                                f.write('\n'.join(vot) + '\n')
+                            # Center then load VOTable (no prompts in Aladin)
+                            center_msg = {'samp.mtype': 'coord.pointAt.sky',
+                                          'samp.params': {'ra': f'{ra0:.7f}', 'dec': f'{dec0:.7f}'}}
+                            table_msg = {'samp.mtype': 'table.load.votable',
+                                         'samp.params': {'url': 'file://' + vot_path}}
+                            for cid in samp_aladin_cids:
+                                try:
+                                    samp_client.notify(cid, center_msg)
+                                    samp_client.notify(cid, table_msg)
+                                except Exception:
+                                    continue
+                        except Exception as e:
+                            print(f"[SAMP] overlay failed: {e}")
+            except Exception:
+                pass
+        # End panel loop for this page: save the figure
+        # Save this page as PNG for HTML rendering
+        try:
+            scripts_dir = os.environ.get('ALADIN_SCRIPTS_DIR', 'aladin_scripts')
+            html_dir = os.path.join(scripts_dir, 'html')
+            os.makedirs(html_dir, exist_ok=True)
+            try:
+                nav_js_path = os.path.join(html_dir, 'nav_keys.js')
+                nav_js = (
+                    "// Keyboard navigation: ←/→ pages; 'a' to trigger Aladin.\n"
+                    "(function(){\n"
+                    "  var _mx, _my; document.addEventListener('mousemove', function(ev){ _mx=ev.clientX; _my=ev.clientY; }, {passive:true});\n"
+                    "  function isEditable(el){ if(!el) return false; var tag=(el.tagName||'').toUpperCase(); return el.isContentEditable||tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'; }\n"
+                    "  function closest(el, sel){ while(el && el.nodeType===1){ if(el.matches && el.matches(sel)) return el; el = el.parentElement; } return null; }\n"
+                    "  function findNav(which){\n"
+                    "    var navs = document.querySelectorAll('.nav');\n"
+                    "    for(var i=0;i<navs.length;i++){\n"
+                    "      var as = navs[i].querySelectorAll('a[href]');\n"
+                    "      for(var j=0;j<as.length;j++){\n"
+                    "        var a = as[j]; var t = (a.textContent||'').trim();\n"
+                    "        if(which==='prev' && t.indexOf('Prev Page') !== -1) return a;\n"
+                    "        if(which==='next' && t.indexOf('Next Page') !== -1) return a;\n"
+                    "      }\n"
+                    "    }\n"
+                    "    var m = (location.pathname||'').match(/([^\\/]+)_page(\\d+)\\.html$/);\n"
+                    "    if(m){ var base = m[1]; var n = parseInt(m[2],10); var target = which==='prev' ? (n-1) : (n+1); if(target>=1){ var a = document.createElement('a'); a.setAttribute('href', base + '_page' + target + '.html'); return a; } }\n"
+                    "    return null;\n"
+                    "  }\n"
+                    "  function triggerAladin(){\n"
+                    "    var cand=null;\n"
+                    "    if(typeof _mx==='number' && typeof _my==='number'){ var el=document.elementFromPoint(_mx,_my); cand = closest(el, 'a.btn.al[data-ajs]'); }\n"
+                    "    if(!cand) cand = document.querySelector('a.btn.al[data-ajs]');\n"
+                    "    if(cand){ try{ cand.click(); return true; }catch(e){} }\n"
+                    "    try{ if(typeof ALADIN_ITEMS!=='undefined' && ALADIN_ITEMS.length){ var idx=(window._srcIdx===undefined?0:window._srcIdx); var ajs = ALADIN_ITEMS[idx] || ALADIN_ITEMS[0]; var u=(typeof SAMP_URL!=='undefined'?SAMP_URL:'http://127.0.0.1:8765'); var base=(u && u.endsWith && u.endsWith('/'))?u.slice(0,-1):u; var url = base + '/run_samp?file=' + encodeURIComponent(ajs) + '&_t=' + Date.now(); var sink=document.getElementsByName('aladin_sink')[0]; if(sink){ try{ sink.src = url; return true; }catch(e){} } try{ window.open(url, '_blank'); return true; }catch(e){} } }catch(e){}\n"
+                    "    return false;\n"
+                    "  }\n"
+                    "  function onKey(e){\n"
+                    "    if(isEditable(e.target)) return;\n"
+                    "    var k = (e.key||'');\n"
+                    "    if(k === 'ArrowLeft'){ var a = findNav('prev'); if(a && a.getAttribute('href')){ e.preventDefault(); location.href = a.getAttribute('href'); } }\n"
+                    "    else if(k === 'ArrowRight'){ var b = findNav('next'); if(b && b.getAttribute('href')){ e.preventDefault(); location.href = b.getAttribute('href'); } }\n"
+                    "    else if(k && k.toLowerCase() === 'a' && !e.ctrlKey && !e.metaKey && !e.altKey){ if(triggerAladin()){ e.preventDefault(); } }\n"
+                    "  }\n"
+                    "  document.addEventListener('keydown', onKey, true);\n"
+                    "})();\n"
+                )
+                if not os.path.exists(nav_js_path):
+                    with open(nav_js_path, 'w') as _f:
+                        _f.write(nav_js)
+            except Exception:
+                pass
+            page_num = (start // per_page) + 1
+            png_name = f'{key}_page{page_num}.png'
+            png_path = os.path.join(html_dir, png_name)
+            html_name = f'{key}_page{page_num}.html'
+            html_path = os.path.join(html_dir, html_name)
+            # Save figure to PNG at a consistent DPI
+            HTML_DPI = int(str(os.environ.get('HTML_DPI', '150')))
+            # Display scale for HTML (e.g., 0.7 makes it 30% smaller)
+            try:
+                HTML_SCALE = float(str(os.environ.get('HTML_SCALE', '0.7')))
+            except Exception:
+                HTML_SCALE = 0.7
+            HTML_SCALE = max(0.2, min(2.0, HTML_SCALE))
+            # Ensure layout is finalized first (so text bboxes match saved PNG), then save
+            try:
+                # Hide in-figure link labels for PNG (HTML uses overlay buttons)
+                for _t in hidden_texts:
+                    try:
+                        _t.set_visible(False)
+                    except Exception:
+                        pass
+                fig.canvas.draw()
+            except Exception:
+                pass
+            # Match renderer DPI to output to avoid bbox scaling mismatch
+            try:
+                fig.set_dpi(HTML_DPI)
+            except Exception:
+                pass
+            fig.savefig(png_path, dpi=HTML_DPI)
+            fig_w = int(fig.get_size_inches()[0] * HTML_DPI)
+            fig_h = int(fig.get_size_inches()[1] * HTML_DPI)
+            disp_w = int(fig_w * HTML_SCALE)
+            disp_h = int(fig_h * HTML_SCALE)
+            xscale = disp_w / max(1, fig_w)
+            yscale = disp_h / max(1, fig_h)
+            # Button size heuristics (pixels)
+            BTN_W = int(110 * HTML_SCALE)
+            BTN_H = int(24 * HTML_SCALE)
+            areas = []
+            renderer = getattr(fig.canvas, 'get_renderer', lambda: None)()
+            for area in page_areas:
+                # Compute overlays from axes window extents with fixed insets
+                ax_index = area.get('ax_index')
+                try:
+                    ax = axes_flat[ax_index]
+                except Exception:
+                    continue
+                try:
+                    win = ax.get_window_extent(renderer=renderer)
+                    x0p, y0p, x1p, y1p = float(win.x0), float(win.y0), float(win.x1), float(win.y1)
+                except Exception:
+                    pos = ax.get_position()
+                    x0p, y0p, x1p, y1p = pos.x0 * fig_w, pos.y0 * fig_h, pos.x1 * fig_w, pos.y1 * fig_h
+                ax_l = int(x0p * xscale)
+                ax_r = int(x1p * xscale)
+                ax_top = int((fig_h - y1p) * yscale)
+                ax_bot = int((fig_h - y0p) * yscale)
+                ax_w = max(0, ax_r - ax_l)
+                ax_h = max(0, ax_bot - ax_top)
+                # Use fixed-pixel inset (scaled) for consistent alignment; user-tunable via HTML_BTN_INSET
+                try:
+                    INSET_PX = int(str(os.environ.get('HTML_BTN_INSET', '16')))
+                except Exception:
+                    INSET_PX = 8
+                inset = max(1, int(INSET_PX * HTML_SCALE))
+                # Top-left button (Aladin)
+                left_x1 = ax_l + inset
+                left_y1 = ax_top + inset
+                left_x2 = min(ax_r, left_x1 + BTN_W)
+                left_y2 = min(ax_bot, left_y1 + BTN_H)
+                # Top-right button (Aladin Lite)
+                right_x2 = ax_r - inset
+                right_x1 = max(ax_l, right_x2 - BTN_W)
+                right_y1 = ax_top + inset
+                right_y2 = min(ax_bot, right_y1 + BTN_H)
+                al_rect = (left_x1, left_y1, left_x2, left_y2)
+                lite_rect = (right_x1, right_y1, right_x2, right_y2)
+
+                areas.append({
+                    'base': area['base'],
+                    'type': 'aladin',
+                    'coords': al_rect,
+                    'href': area['aladin'],
+                })
+                areas.append({
+                    'base': area['base'],
+                    'type': 'lite',
+                    'coords': lite_rect,
+                    'href': area['lite'],
+                })
+            # Write page HTML
+            map_name = f"map_{key}_{page_num}"
+            lines = [
+                '<!doctype html>',
+                '<meta charset="utf-8">',
+                f'<title>{key} — Page {page_num}</title>',
+                # Responsive layout: image scales to container width, overlays use % positions
+                '<style>'
+                'body{margin:10px;background:#fafafa}'
+                f'.wrap{{position:relative;max-width:100%;width:{disp_w}px}}'
+                'img{display:block;width:100%;height:auto;border:0;box-shadow:0 1px 6px rgba(0,0,0,.1)}'
+                '.btn{position:absolute;display:flex;align-items:center;justify-content:center;padding:2px 6px;'
+                'border-radius:4px;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial;font-size:calc(10px + 0.2vw);'
+                'color:#fff;text-decoration:none;cursor:pointer;z-index:10;opacity:.92}'
+                '.btn:hover{opacity:1}'
+                '.btn.al{background:#2ca02c}'
+                '.btn.lite{background:#1f77b4}'
+                '.nav{margin-bottom:8px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Arial}'
+                '</style>',
+                # Navigation links
+                '<div class="nav">'
+            ]
+            prev_name = f'{key}_page{page_num-1}.html' if page_num>1 else ''
+            next_name = f'{key}_page{page_num+1}.html' if page_num<total_pages else ''
+            if prev_name:
+                lines.append(f'<a href="{prev_name}">« Prev Page</a>')
+            if next_name:
+                if prev_name:
+                    lines.append(' | ')
+                lines.append(f'<a href="{next_name}">Next Page »</a>')
+            # Keyboard usage hint in the top nav
+            lines.append('<span style="opacity:.7;margin-left:8px">Keyboard: ←/→ pages, ↑/↓ FOV, "a" Aladin</span>')
+            # Zoom controls
+            lines.append(' | <a href="#" onclick="return zoomStep(1/1.5)" title="Zoom out">Zoom −</a>')
+            lines.append(' | <a href="#" onclick="return zoomStep(1.5)" title="Zoom in">Zoom +</a>')
+            # Top-right link to go back one level (master index)
+            lines.append('<span style="float:right"><a href="../../aladin_index.html" title="Back to index">Back</a></span>')
+            # Jump-to-page form
+            lines.append(
+                f'<form class="jump" onsubmit="return gotoPageFromInput(this);" '
+                f'style="display:inline;margin-left:10px">'
+                f'<label>Page <input type="number" min="1" max="{total_pages}" value="{page_num}" '
+                f'style="width:4em" /> of {total_pages}</label> '
+                f'<button type="submit">Go</button>'
+                f'</form>'
+            )
+            lines += [
+                '</div>',
+                # hidden sink frame so link navigations don't replace the page
+                '<iframe name="aladin_sink" width="0" height="0" style="display:none;border:0;position:absolute;left:-9999px;"></iframe>',
+                f'<div class="wrap"><img src="{png_name}" alt="">'
+            ]
+            # Overlay anchors
+            aladin_items_js = []
+            for a in areas:
+                x1, y1, x2, y2 = a['coords']
+                w = max(1, x2 - x1); h = max(1, y2 - y1)
+                # Convert to percentages for responsive scaling
+                lp = (x1 / disp_w) * 100.0
+                tp = (y1 / disp_h) * 100.0
+                wp = (w  / disp_w) * 100.0
+                hp = (h  / disp_h) * 100.0
+                href = a['href'] if a['href'] else ''
+                if a['type'] == 'aladin':
+                    base_ajs = a['base'] + '.ajs'
+                    default_http = f'http://127.0.0.1:8765/run_samp?file={base_ajs}'
+                    lines.append(
+                        f'<a class="btn al" style="left:{lp:.3f}%;top:{tp:.3f}%;width:{wp:.3f}%;height:{hp:.3f}%;" '
+                        f'href="{default_http}" target="aladin_sink" data-ajs="{base_ajs}" onclick="return runSamp(event,this);" title="Aladin">Aladin</a>'
+                    )
+                    aladin_items_js.append(base_ajs)
+                else:
+                    lines.append(
+                        f'<a class="btn lite" style="left:{lp:.3f}%;top:{tp:.3f}%;width:{wp:.3f}%;height:{hp:.3f}%;" '
+                        f'href="{href}" title="Aladin Lite" target="_blank" rel="noopener">Aladin&nbsp;Lite</a>'
+                    )
+            lines.append('</div>')
+            # JS helper to call local SAMP link server when available
+            lines += [
+                '<script>\n'
+                f'const ALADIN_ITEMS = {aladin_items_js!s};\n'
+                'const SAMP_URL = (window.localStorage && localStorage.getItem("ALADIN_LINK_URL")) || "http://127.0.0.1:8765";\n'
+                f'const PAGE_KEY = {key!r}; const PAGE_NUM = {page_num}; const TOTAL_PAGES = {total_pages};\n'
+                'function _baseUrl(u){ try{ return (u && u.endsWith && u.endsWith("/")) ? u.slice(0,-1) : u; }catch(e){ return u; } }\n'
+                'function runSamp(ev, el){\n'
+                '  try{\n'
+                '    const ajs = el.getAttribute("data-ajs");\n'
+                '    const base = _baseUrl(SAMP_URL);\n'
+                '    const url = base + "/run_samp?file=" + encodeURIComponent(ajs) + "&_t=" + Date.now();\n'
+                '    // Update link target/href to use the configured helper, let browser navigate in hidden frame\n'
+                '    el.href = url;\n'
+                '    el.target = "aladin_sink";\n'
+                '  }catch(e){}\n'
+                '  return true;\n'
+                '}\n'
+                'function gotoPage(n){ try{ n = parseInt(n,10)||1; }catch(e){ n=1;} if(n<1) n=1; if(n>TOTAL_PAGES) n=TOTAL_PAGES; window.location.href = PAGE_KEY + "_page" + n + ".html"; return false; }\n'
+                'function gotoPageFromInput(form){ var inp = form.querySelector("input[type=number]"); if(!inp) return false; return gotoPage(inp.value); }\n'
+                'async function nextSrc(dir){\n'
+                '  if(!ALADIN_ITEMS.length) return false;\n'
+                '  window._srcIdx = (window._srcIdx===undefined? -1 : window._srcIdx) + (dir||1);\n'
+                '  if(window._srcIdx < 0) window._srcIdx = ALADIN_ITEMS.length-1;\n'
+                '  if(window._srcIdx >= ALADIN_ITEMS.length) window._srcIdx = 0;\n'
+                '  const ajs = ALADIN_ITEMS[window._srcIdx];\n'
+                '  try{ const base = _baseUrl(SAMP_URL); const url = base + "/run_samp?file=" + encodeURIComponent(ajs); await fetch(url); }catch(e){}\n'
+                '  return false;\n'
+                '}\n'
+                '</script>'
+            ]
+            # Remove bottom per-source nav (was unreliable without local server)
+            lines.append('<script src="nav_keys.js"></script>')
+            with open(html_path, 'w') as f:
+                f.write('\n'.join(lines) + '\n')
+            page_files.append(os.path.join('html', html_name))
+        except Exception as e:
+            print(f"[html] Failed to write page HTML: {e}")
+
         if pdf:
+            # Restore labels for PDF version
+            try:
+                for _t in hidden_texts:
+                    try:
+                        _t.set_visible(True)
+                    except Exception:
+                        pass
+                fig.canvas.draw()
+            except Exception:
+                pass
             pdf.savefig(fig)
-            plt.close(fig)
+        plt.close(fig)
+    # Close SAMP connection
+    if samp_client is not None:
+        try:
+            samp_client.disconnect()
+        except Exception:
+            pass
     if pdf:
         pdf.close()
+
+    # Skip writing per-catalog index pages; we'll link directly to page 1 from the master index
 
 
 # Modify main() to return combined_df and catalogs for interactive use
@@ -2168,6 +2927,10 @@ def main() -> None:
                         help='Invert grayscale colormap for background images (2MASS J)')
     parser.add_argument('--no-images', action='store_true', default=False,
                         help='Skip downloading 2MASS J images in PDFs (faster, avoids network stalls)')
+    parser.add_argument('--samp', action='store_true', default=False,
+                        help='If an Aladin SAMP hub is running, send panel views to Aladin Desktop')
+    parser.add_argument('--samp-addr', default='127.0.0.1',
+                        help='Local address to bind the SAMP client to (127.0.0.1 or ::1)')
     parser.add_argument('--chandra-csv-path', default='/Users/ettoref/ASTRONOMY/DATA/N2264_XMM_alt/N2264_acis12.csv',
                         help='Path to pre-exported Chandra CSV with columns ra_deg,dec_deg,epos/pub_n')
     args, _ = parser.parse_known_args()
@@ -2192,7 +2955,7 @@ def main() -> None:
     }
     # Define the central coordinate of NGC 2264 and search radius
     center = SkyCoord(ra=100.25 * u.deg, dec=9.883333 * u.deg, frame='icrs')
-    radius = 0.1 * u.deg
+    radius = 0.02 * u.deg
 
     print("Querying Gaia DR3 ...")
     gaia = query_gaia(center, radius)
@@ -2234,9 +2997,12 @@ def main() -> None:
     # Store minimal original catalogs for reference as dict of DataFrames
     catalogs: dict[str, object] = {}
     # Save Gaia catalog (indexed by gaia_id) as DataFrame with factor and min_radius
+    # Build Gaia columns list defensively in case cache lacks PM fields
+    gaia_cols_base = ['ra_deg','dec_deg','errMaj','errMin','errPA']
+    gaia_cols_pm = ['pmra','pmdec','pmra_error','pmdec_error','ref_epoch']
+    gaia_cols = gaia_cols_base + [c for c in gaia_cols_pm if c in gaia.columns]
     catalogs['gaia'] = {
-        'data': gaia.set_index('gaia_id')[['ra_deg','dec_deg','errMaj','errMin','errPA',
-                                           'pmra','pmdec','pmra_error','pmdec_error','ref_epoch']],
+        'data': gaia.set_index('gaia_id')[gaia_cols],
         **catalog_params['gaia']
     }
 
@@ -2398,7 +3164,10 @@ def main() -> None:
                 ncols=GRID_COLS,
                 nrows=GRID_ROWS,
                 invert_cmap=INVERT_CMAP,
-                draw_images=(not args.no_images)
+                draw_images=(not args.no_images),
+                aladin_dir=os.environ.get('ALADIN_SCRIPTS_DIR', 'aladin_scripts'),
+                samp_enabled=args.samp,
+                samp_addr=args.samp_addr
             )
     # Keep only coordinate, error ellipse, and identification columns in the final catalog
     # id_columns = [
@@ -2409,6 +3178,35 @@ def main() -> None:
     # combined_df = combined_df[id_columns]
     combined_df.to_csv('ngc2264_combined.csv', index=False)
     print(f"Master catalog written to ngc2264_combined.csv ({len(combined_df)} rows)")
+
+    # Write a master HTML index that links directly to page 1 for each catalog
+    try:
+        scripts_dir = os.environ.get('ALADIN_SCRIPTS_DIR', 'aladin_scripts')
+        first_pages = []
+        html_dir = os.path.join(scripts_dir, 'html')
+        if os.path.isdir(html_dir):
+            for name in sorted(os.listdir(html_dir)):
+                if name.endswith('_page1.html'):
+                    first_pages.append(name)
+        if first_pages:
+            lines = [
+                '<!doctype html>',
+                '<meta charset="utf-8">',
+                '<title>Aladin Index</title>',
+                '<style>body{font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Arial} li{margin:6px 0}</style>',
+                '<h2>Aladin Index</h2>',
+                '<ul>'
+            ]
+            for p in first_pages:
+                # label is the prefix before _page1.html
+                lab = p.replace('_page1.html','')
+                lines.append(f'<li><a href="{scripts_dir}/html/{p}">{lab}</a></li>')
+            lines.append('</ul>')
+            with open('aladin_index.html','w') as f:
+                f.write('\n'.join(lines) + '\n')
+            print('[index] Wrote aladin_index.html')
+    except Exception as e:
+        print(f"[index] Could not write master HTML index: {e}")
     return combined_df, catalogs
 
 
