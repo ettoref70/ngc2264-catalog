@@ -82,12 +82,7 @@ def create_app() -> Flask:
         # Return cached subset if present
         if key in DATA:
             return DATA[key]
-        # Try fast path from prebuilt combined CSV
-        fast = _try_build_from_combined(key)
-        if fast is not None:
-            DATA[key] = fast
-            return fast
-        # Fallback to building from queries, limited to gaia + requested key
+        # Build from queries/caches to ensure per-catalog ellipses and positions are correct.
         refresh = (os.environ.get('DYN_REFRESH', '0') in ('1', 'true', 'yes'))
         include = ['gaia', '2MASS'] if key.lower() in ('2mass', '2mass_j', '2massj') else ['gaia', key]
         combined_df, catalogs = cm.build_data_for_web(refresh=refresh,
@@ -96,7 +91,7 @@ def create_app() -> Flask:
         DATA[key] = (combined_df, catalogs)
         return DATA[key]
 
-    def _ensure_pages_for(key: str, page_num: int) -> None:
+    def _ensure_pages_for(key: str, page_num: int, *, draw_images: bool | None = None) -> None:
         combined_df, catalogs = _load_data_for_key(key)
         if key not in catalogs:
             abort(404)
@@ -133,8 +128,9 @@ def create_app() -> Flask:
         except Exception:
             ncols, nrows = 2, 2
         invert = (os.environ.get('DYN_INVERT_CMAP', '1') in ('1', 'true', 'yes'))
-        # Default to no images for responsiveness unless explicitly enabled.
-        draw_images = not (os.environ.get('DYN_NO_IMAGES', '1') in ('1', 'true', 'yes'))
+        # Default to draw images unless explicitly disabled or overridden via arg
+        if draw_images is None:
+            draw_images = not (os.environ.get('DYN_NO_IMAGES', '0') in ('1', 'true', 'yes'))
         # Generate only the requested page for this catalog (writes to aladin_scripts/html)
         # Use env var understood by the plotter to limit generation to a single page
         os.environ['ALADIN_PAGE_ONLY'] = str(int(page_num))
@@ -180,7 +176,8 @@ def create_app() -> Flask:
     @app.get('/page/<key>/<int:page>')
     def page(key: str, page: int):
         # Ensure that static HTML pages exist for this catalog; then serve the requested page
-        _ensure_pages_for(key, page)
+        want_img = request.args.get('img', '').lower() in ('1','true','yes','on')
+        _ensure_pages_for(key, page, draw_images=want_img or None)
         fname = f"{key}_page{page}.html"
         fpath = HTML_DIR / fname
         if not fpath.exists():
@@ -191,6 +188,19 @@ def create_app() -> Flask:
     # Serve generated assets under /aladin_scripts/html/...
     @app.get('/aladin_scripts/html/<path:subpath>')
     def serve_generated(subpath: str):
+        # If a requested page doesn't exist yet or we want to always refresh pages,
+        # generate it on the fly by parsing the pattern <key>_page<N>.html
+        import re as _re
+        m = _re.match(r"^([^_/]+)_page(\d+)\.(html|jpg|png|webp)$", subpath)
+        if m:
+            key = m.group(1)
+            page_num = int(m.group(2))
+            # Allow forcing image background via query param
+            want_img = request.args.get('img', '').lower() in ('1','true','yes','on')
+            try:
+                _ensure_pages_for(key, page_num, draw_images=want_img or None)
+            except Exception:
+                pass
         fpath = (HTML_DIR / subpath)
         if not _is_safe_path(HTML_DIR, fpath) or not fpath.exists():
             abort(404)

@@ -32,6 +32,15 @@ from typing import List, Optional
 import numpy as np
 import numpy.linalg as la
 
+import os as _os
+import matplotlib as _mpl
+# Force a non-interactive backend when used in servers/threads unless explicitly overridden
+try:
+    _bk = str(_os.environ.get('MPLBACKEND', '')).lower()
+    if _bk not in ('agg', 'module://matplotlib_inline.backend_inline'):
+        _mpl.use('Agg', force=True)
+except Exception:
+    pass
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 from matplotlib.backends.backend_pdf import PdfPages
@@ -911,60 +920,96 @@ def cross_match(source_df: pd.DataFrame,
         vmin = np.array([-cphi, sphi])
         oth_cov[j] = a*a * np.outer(vmaj, vmaj) + b*b * np.outer(vmin, vmin)
 
+    # Precompute fast bounds and arrays for candidate pruning
+    other_ra = other_df['ra_deg'].values
+    other_dec = other_df['dec_deg'].values
+    r_src_bound = np.maximum(src_maj, src_min)  # deg
+    r_oth_bound = np.maximum(oth_maj, oth_min)  # deg
+    r_oth_max = float(r_oth_bound.max()) if len(r_oth_bound) else 0.0
+    # Precompute per-row epochs for other_df once
+    epoch_list = []
+    for _j in range(len(other_df)):
+        try:
+            epoch_list.append(_epoch_of_row(_j))
+        except Exception:
+            epoch_list.append(None)
+    # Epoch span across the secondary catalog
+    if any(e is not None for e in epoch_list):
+        _e_arr = np.array([e if e is not None else np.nan for e in epoch_list], dtype=float)
+        try:
+            min_epoch = float(np.nanmin(_e_arr))
+            max_epoch = float(np.nanmax(_e_arr))
+        except Exception:
+            min_epoch = max_epoch = None
+    else:
+        min_epoch = max_epoch = None
+    # PM arrays
+    pmra_arr = source_df['pmra'].fillna(0.0).values if 'pmra' in source_df.columns else np.zeros(len(source_df))
+    pmdec_arr = source_df['pmdec'].fillna(0.0).values if 'pmdec' in source_df.columns else np.zeros(len(source_df))
+    pmra_err_arr = source_df['pmra_error'].fillna(0.0).values if 'pmra_error' in source_df.columns else np.zeros(len(source_df))
+    pmdec_err_arr = source_df['pmdec_error'].fillna(0.0).values if 'pmdec_error' in source_df.columns else np.zeros(len(source_df))
+    ref_epoch_arr = source_df['ref_epoch'].values if 'ref_epoch' in source_df.columns else np.full(len(source_df), np.nan)
+    # Precompute PM speed (deg/yr) for each source
+    pm_speed_deg_yr = np.hypot(pmra_arr, pmdec_arr) / 1000.0 / 3600.0
+
     matches = []
     for i in range(len(source_df)):
         # Offsets in degrees: RA scaled by cos(dec) for sky projection
-        dec0 = np.deg2rad(source_df.iloc[i]['dec_deg'])
-        ra0  = source_df.iloc[i]['ra_deg']
-        dra  = (other_df['ra_deg'].values - ra0) * np.cos(dec0)
-        ddec = other_df['dec_deg'].values - source_df.iloc[i]['dec_deg']
+        dec0_deg = float(source_df.iloc[i]['dec_deg'])
+        dec0 = np.deg2rad(dec0_deg)
+        ra0  = float(source_df.iloc[i]['ra_deg'])
+        cosd = np.cos(dec0)
+        dra  = (other_ra - ra0) * cosd
+        ddec = (other_dec - dec0_deg)
 
-        # Apply proper-motion shift of the source position to the per-row target epoch (if available)
-        dx_pm = 0.0
-        dy_pm = 0.0
-        epoch_j = _epoch_of_row(j)
-        if (epoch_j is not None) and has_pm and has_epoch:
+        # Compute a conservative search radius (deg) for candidates
+        pm_shift_max = 0.0
+        if has_pm and has_epoch and (min_epoch is not None) and (max_epoch is not None):
             try:
-                ref_ep = float(source_df.iloc[i]['ref_epoch'])
+                ref_ep = float(ref_epoch_arr[i])
             except Exception:
-                ref_ep = None
-            if ref_ep is not None and not np.isnan(ref_ep):
-                dt = float(epoch_j - ref_ep)
-                try:
-                    pmra_val = float(source_df.iloc[i]['pmra'])
-                except Exception:
-                    pmra_val = 0.0
-                try:
-                    pmdec_val = float(source_df.iloc[i]['pmdec'])
-                except Exception:
-                    pmdec_val = 0.0
-                # pmra is mu_alpha* (RA*cosDec) in mas/yr; convert to deg shift along RA* axis
-                dx_pm = (pmra_val / 1000.0 / 3600.0) * dt
-                dy_pm = (pmdec_val / 1000.0 / 3600.0) * dt
+                ref_ep = np.nan
+            if not (ref_ep is None or np.isnan(ref_ep)):
+                dt_max = max(abs(min_epoch - ref_ep), abs(max_epoch - ref_ep))
+                pm_shift_max = pm_speed_deg_yr[i] * float(dt_max)
+        R_bound = float(r_src_bound[i]) + r_oth_max + pm_shift_max
+        if R_bound <= 0:
+            R_bound = float(r_src_bound[i]) + r_oth_max
+        R2 = R_bound * R_bound
+        # Vectorized prefilter by Euclidean distance in projected plane
+        mask = (dra * dra + ddec * ddec) <= R2
+        cand_idx = np.nonzero(mask)[0]
 
         ids = []
-        for j in range(len(other_df)):
-            # Combined covariance matrix
-            C = src_cov[i] + oth_cov[j]
-            # Add PM-uncertainty inflation for the baseline to this row's epoch
-            if (epoch_j is not None) and has_pm_err and has_epoch:
+        # Evaluate only candidates with full Mahalanobis test
+        for j in cand_idx:
+            # Per-row epoch for PM shift
+            epoch_j = epoch_list[j]
+            dx_pm = 0.0
+            dy_pm = 0.0
+            if (epoch_j is not None) and has_pm and has_epoch:
                 try:
-                    ref_ep = float(source_df.iloc[i]['ref_epoch'])
+                    ref_ep = float(ref_epoch_arr[i])
                 except Exception:
                     ref_ep = None
                 if ref_ep is not None and not np.isnan(ref_ep):
                     dt = float(epoch_j - ref_ep)
-                    try:
-                        pmra_e = float(source_df.iloc[i]['pmra_error'])
-                    except Exception:
-                        pmra_e = 0.0
-                    try:
-                        pmdec_e = float(source_df.iloc[i]['pmdec_error'])
-                    except Exception:
-                        pmdec_e = 0.0
-                    sig_ra_deg = abs(pmra_e) / 1000.0 / 3600.0 * abs(dt)
-                    sig_de_deg = abs(pmdec_e) / 1000.0 / 3600.0 * abs(dt)
+                    dx_pm = (pmra_arr[i] / 1000.0 / 3600.0) * dt
+                    dy_pm = (pmdec_arr[i] / 1000.0 / 3600.0) * dt
+
+            # Combined covariance matrix with PM error inflation if available
+            C = src_cov[i] + oth_cov[j]
+            if (epoch_j is not None) and has_pm_err and has_epoch:
+                try:
+                    ref_ep = float(ref_epoch_arr[i])
+                except Exception:
+                    ref_ep = None
+                if ref_ep is not None and not np.isnan(ref_ep):
+                    dt = float(epoch_j - ref_ep)
+                    sig_ra_deg = abs(pmra_err_arr[i]) / 1000.0 / 3600.0 * abs(dt)
+                    sig_de_deg = abs(pmdec_err_arr[i]) / 1000.0 / 3600.0 * abs(dt)
                     C = C + np.diag([sig_ra_deg**2, sig_de_deg**2])
+
             # Invert covariance, with fallback regularization if singular
             try:
                 invC = la.inv(C)
@@ -973,44 +1018,40 @@ def cross_match(source_df: pd.DataFrame,
                 try:
                     invC = la.inv(C + jitter)
                 except la.LinAlgError:
-                    # Skip this pair if still singular
                     continue
-            # Subtract the source PM shift so comparison is at the catalog row's epoch
             vec = np.array([dra[j] - dx_pm, ddec[j] - dy_pm])
-            # Mahalanobis squared distance
             D2 = vec.dot(invC).dot(vec)
-            # Only match if within 1-sigma ellipse
             if D2 <= 1.0:
-                # Preserve the original ID type: use column value if present, else index
                 if other_id_col in other_df.columns:
                     ids.append(other_df.iloc[j][other_id_col])
                 else:
                     ids.append(other_df.index[j])
         matches.append(ids)
 
-    # --- Precompute reverse assignment (other -> master) with the same Mahalanobis test ---
-    assign_of_other = [None] * n_oth
-    D2_best_arr = np.full(n_oth, np.inf, dtype=float)
-    sep_best_arr = np.full(n_oth, np.nan, dtype=float)
-    dec_src_rad_all = np.deg2rad(source_df['dec_deg'].values)
-    for j in range(n_oth):
-        dra_vec = (other_df['ra_deg'].iloc[j] - source_df['ra_deg'].values) * np.cos(dec_src_rad_all)
-        ddec_vec = (other_df['dec_deg'].iloc[j] - source_df['dec_deg'].values)
-        D2_vals = np.empty(n_src, dtype=float)
-        for i in range(n_src):
-            Csum = src_cov[i] + oth_cov[j]
-            try:
-                invC = la.inv(Csum)
-            except la.LinAlgError:
-                invC = la.inv(Csum + np.eye(2) * 1e-12)
-            v = np.array([dra_vec[i], ddec_vec[i]])
-            D2_vals[i] = float(v.dot(invC).dot(v))
-        i_best = int(np.argmin(D2_vals)) if len(D2_vals) else None
-        if len(D2_vals):
-            D2_best_arr[j] = float(D2_vals[i_best])
-            sep_best_arr[j] = float(np.hypot(dra_vec[i_best], ddec_vec[i_best]) * 3600.0)
-            if D2_best_arr[j] <= 1.0:
-                assign_of_other[j] = i_best
+    # --- Precompute reverse assignment (other -> master) only if plotting PDF ---
+    if pdf:
+        assign_of_other = [None] * n_oth
+        D2_best_arr = np.full(n_oth, np.inf, dtype=float)
+        sep_best_arr = np.full(n_oth, np.nan, dtype=float)
+        dec_src_rad_all = np.deg2rad(source_df['dec_deg'].values)
+        for j in range(n_oth):
+            dra_vec = (other_df['ra_deg'].iloc[j] - source_df['ra_deg'].values) * np.cos(dec_src_rad_all)
+            ddec_vec = (other_df['dec_deg'].iloc[j] - source_df['dec_deg'].values)
+            D2_vals = np.empty(n_src, dtype=float)
+            for i in range(n_src):
+                Csum = src_cov[i] + oth_cov[j]
+                try:
+                    invC = la.inv(Csum)
+                except la.LinAlgError:
+                    invC = la.inv(Csum + np.eye(2) * 1e-12)
+                v = np.array([dra_vec[i], ddec_vec[i]])
+                D2_vals[i] = float(v.dot(invC).dot(v))
+            i_best = int(np.argmin(D2_vals)) if len(D2_vals) else None
+            if len(D2_vals):
+                D2_best_arr[j] = float(D2_vals[i_best])
+                sep_best_arr[j] = float(np.hypot(dra_vec[i_best], ddec_vec[i_best]) * 3600.0)
+                if D2_best_arr[j] <= 1.0:
+                    assign_of_other[j] = i_best
 
     if pdf:
         # Helper: robust membership check for IDs (handles int/str mismatches)
@@ -1101,25 +1142,25 @@ def cross_match(source_df: pd.DataFrame,
                 for k in range(len(other_df)):
                     if abs(dx_oth.iloc[k]) <= margin and abs(dy_oth.iloc[k]) <= margin:
                         e = Ellipse((dx_oth.iloc[k], dy_oth.iloc[k]),
-                                    width=2*oth_maj_plot[k],
-                                    height=2*oth_min_plot[k],
-                                    angle=other_df.iloc[k]['errPA'],
+                                    width=2*oth_min_plot[k],
+                                    height=2*oth_maj_plot[k],
+                                    angle=(90.0 - float(other_df.iloc[k]['errPA'])),
                                     edgecolor='lightblue', linestyle='-', fill=False)
                         ax.add_patch(e)
                 # Plot all master-catalog ellipses in light red
                 for m in range(len(source_df)):
                     if abs(dx_src.iloc[m]) <= margin and abs(dy_src.iloc[m]) <= margin:
                         e = Ellipse((dx_src.iloc[m], dy_src.iloc[m]),
-                                    width=2*src_maj_plot[m],
-                                    height=2*src_min_plot[m],
-                                    angle=source_df.iloc[m]['errPA'],
+                                    width=2*src_min_plot[m],
+                                    height=2*src_maj_plot[m],
+                                    angle=(90.0 - float(source_df.iloc[m]['errPA'])),
                                     edgecolor='lightcoral', linestyle='-', fill=False)
                         ax.add_patch(e)
                 # Overlay and highlight the specific new source (blue solid)
                 ell_new = Ellipse((0, 0),
-                                  width=2*oth_maj_plot[j],
-                                  height=2*oth_min_plot[j],
-                                  angle=other_df.iloc[j]['errPA'],
+                                  width=2*oth_min_plot[j],
+                                  height=2*oth_maj_plot[j],
+                                  angle=(90.0 - float(other_df.iloc[j]['errPA'])),
                                   edgecolor='blue', linestyle='-',
                                   fill=False, label=f"new: {other_id_col.replace('_id','')}")
                 ax.add_patch(ell_new)
@@ -1172,9 +1213,9 @@ def cross_match(source_df: pd.DataFrame,
                                 _maj_m = float(crow['errMaj'])
                                 _min_m = float(crow['errMin'])
                             ell_m = Ellipse((dxm, dym),
-                                            width=2*_maj_m,
-                                            height=2*_min_m,
-                                            angle=crow['errPA'],
+                                            width=2*_min_m,
+                                            height=2*_maj_m,
+                                            angle=(90.0 - float(crow['errPA'])),
                                             edgecolor='red', linestyle='-',
                                             fill=False,
                                             label=(f'master:{key}' if f'master:{key}' not in shown_labels else None))
@@ -1534,8 +1575,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
         maj = float(np.sqrt(max(vals[0], 0.0)))
         min_ = float(np.sqrt(max(vals[1], 0.0)))
         v = vecs[:, 0]
-        pa = float((np.degrees(np.arctan2(v[0], v[1])) % 360.0))
-        return maj, min_, pa
+        # Position angle from North through East (PA_NE)
+        pa_ne = float((np.degrees(np.arctan2(v[0], v[1])) % 360.0))
+        # For plotting with ΔRA on x and inverted x-axis, use angle = PA - 90
+        return maj, min_, (pa_ne - 90.0)
 
     # Build short-id maps from all catalogs
     index_maps: dict[str, dict] = {}
@@ -1583,7 +1626,15 @@ def plot_after_merge(combined_df: pd.DataFrame,
         oth_maj_plot = other_df['errMaj'].values
         oth_min_plot = other_df['errMin'].values
 
+    # Allow restricting generation to a single page via env: ALADIN_PAGE_ONLY
+    try:
+        _page_only = int(str(os.environ.get('ALADIN_PAGE_ONLY', '0')))
+    except Exception:
+        _page_only = 0
     for start in range(0, total, per_page):
+        page_num = (start // per_page) + 1
+        if _page_only > 0 and page_num != _page_only:
+            continue
         end = min(start + per_page, total)
         indices = list(range(start, end))
         fig, axes = plt.subplots(nrows, ncols, figsize=(11, 8.5), constrained_layout=True)
@@ -1691,9 +1742,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
             for k in range(len(other_df)):
                 if abs(dx_oth.iloc[k]) <= margin and abs(dy_oth.iloc[k]) <= margin:
                     e = Ellipse((dx_oth.iloc[k], dy_oth.iloc[k]),
-                                width=2*oth_maj_plot[k],
-                                height=2*oth_min_plot[k],
-                                angle=other_df.iloc[k]['errPA'],
+                                width=2*oth_min_plot[k],
+                                height=2*oth_maj_plot[k],
+                                angle=(90.0 - float(other_df.iloc[k]['errPA'])),
                                 edgecolor='lightblue', linestyle='-', fill=False)
                     ax.add_patch(e)
 
@@ -1718,8 +1769,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
 
             # Overlay the specific new source
             e0 = Ellipse((0, 0),
-                         width=2*oth_maj_plot[j], height=2*oth_min_plot[j],
-                         angle=other_df.iloc[j]['errPA'],
+                         width=2*oth_min_plot[j], height=2*oth_maj_plot[j],
+                         angle=(90.0 - float(other_df.iloc[j]['errPA'])),
                          edgecolor=cur_color, linestyle='-', fill=False,
                          label=f"new: {key}")
             ax.add_patch(e0)
@@ -1786,8 +1837,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                 _maj_m = float(crow['errMaj'])
                                 _min_m = float(crow['errMin'])
                             lw = 1.8 if kcat == 'gaia' else 1.2
-                            ell_m = Ellipse((dxm, dym), width=2*_maj_m, height=2*_min_m,
-                                            angle=crow['errPA'], edgecolor=CAT_COLORS.get(kcat, 'red'), linestyle='-',
+                            ell_m = Ellipse((dxm, dym), width=2*_min_m, height=2*_maj_m,
+                                            angle=(90.0 - float(crow['errPA'])), edgecolor=CAT_COLORS.get(kcat, 'red'), linestyle='-',
                                             linewidth=lw, fill=False, label=None)
                             ax.add_patch(ell_m)
                             # Emphasize matched GAIA position with a colored plus + PM arrow/inflated ellipse
@@ -1870,7 +1921,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         _maj_m = float(crow['errMaj'])
                         _min_m = float(crow['errMin'])
                     ell_bg = Ellipse((dxm, dym), width=2*_maj_m, height=2*_min_m,
-                                     angle=crow['errPA'], edgecolor=CAT_COLORS.get(kcat, 'red'), linestyle='-',
+                                     angle=(float(crow['errPA']) - 90.0), edgecolor=CAT_COLORS.get(kcat, 'red'), linestyle='-',
                                      linewidth=0.8, fill=False, alpha=0.28)
                     ax.add_patch(ell_bg)
 
@@ -2063,39 +2114,32 @@ def plot_after_merge(combined_df: pd.DataFrame,
             def _fmt(val):
                 return str(val) if val is not None else '—'
 
-            # Build table columns and headers; if GAIA is present, add a Gmag column right after it
+            # Build table columns and headers; draw G magnitude near the right panel edge (not in table)
             col_keys = list(display_cats)
             add_gmag = ('gaia' in display_cats) and ('Gmag' in combined_df.columns)
-            if add_gmag:
-                gi = col_keys.index('gaia')
-                col_keys.insert(gi + 1, 'gaia_g')  # synthetic key for Gmag display
-            headers = [
-                ('G' if k == 'gaia_g' else k.upper())
-                for k in col_keys
-            ]
+            headers = [k.upper() for k in col_keys]
             raw_rows = []  # list of (cells_list, is_matched)
+            g_values = []  # per-row G values (strings) to render at right edge
             for m, _dist in cand_with_dist:
                 mrow = combined_df.iloc[m]
                 cells = []
                 for kcat in col_keys:
-                    if kcat == 'gaia_g':
-                        # Show Gaia G magnitude next to the GAIA id
-                        if ('gaia_id' in combined_df.columns and not _is_missing(mrow.get('gaia_id', None))
-                                and ('Gmag' in combined_df.columns) and pd.notna(mrow.get('Gmag', np.nan))):
-                            try:
-                                gval = float(mrow['Gmag'])
-                                cells.append(f"{gval:.2f}")
-                            except Exception:
-                                cells.append(_fmt(None))
-                        else:
-                            cells.append(_fmt(None))
-                        continue
                     colname = col_for[kcat]
                     if colname in combined_df.columns and not _is_missing(mrow.get(colname, None)):
                         cells.append(_fmt(_short_of(kcat, mrow[colname])))
                     else:
                         cells.append(_fmt(None))
                 raw_rows.append((cells, (m in matched_set)))
+                # Right-edge G value
+                if add_gmag and ('gaia_id' in combined_df.columns) and not _is_missing(mrow.get('gaia_id', None)) \
+                        and pd.notna(mrow.get('Gmag', np.nan)):
+                    try:
+                        gval = float(mrow['Gmag'])
+                        g_values.append(f"{gval:.2f}")
+                    except Exception:
+                        g_values.append(_fmt(None))
+                else:
+                    g_values.append(_fmt(None))
 
             if headers:
                 # Compute column widths from headers and rows (in characters)
@@ -2139,10 +2183,15 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 for i, head in enumerate(headers):
                     trans = offset_copy(ax.transAxes, fig=fig, x=x_offsets[i], y=0, units='points')
                     key_i = col_keys[i]
-                    key_color = CAT_COLORS.get('gaia' if key_i == 'gaia_g' else key_i, 'black')
+                    key_color = CAT_COLORS.get(key_i, 'black')
                     ax.text(0.05, y0, head, transform=trans,
                             va='top', ha='left', family='monospace', fontsize=font_size,
                             fontweight='bold', color=key_color)
+                # Right-edge G header
+                if add_gmag:
+                    ax.text(0.95, y0, 'G', transform=ax.transAxes,
+                            va='top', ha='right', family='monospace', fontsize=font_size,
+                            fontweight='bold', color=CAT_COLORS.get('gaia','black'))
 
                 # Draw rows per column, color-coded and bold if matched; add '✓ ' on matched rows
                 for r_idx, (cells, is_matched) in enumerate(rows_limited):
@@ -2154,11 +2203,17 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             text_cell = prefix + text_cell
                         trans = offset_copy(ax.transAxes, fig=fig, x=x_offsets[i], y=0, units='points')
                         key_i = col_keys[i]
-                        key_color = CAT_COLORS.get('gaia' if key_i == 'gaia_g' else key_i, 'black')
+                        key_color = CAT_COLORS.get(key_i, 'black')
                         ax.text(0.05, y, text_cell.ljust(col_w[i]), transform=trans,
                                 va='top', ha='left', family='monospace', fontsize=font_size,
                                 fontweight=('bold' if is_matched else 'normal'),
                                 color=key_color)
+                    # Right-edge G value
+                    if add_gmag and r_idx < len(g_values):
+                        ax.text(0.95, y, str(g_values[r_idx]), transform=ax.transAxes,
+                                va='top', ha='right', family='monospace', fontsize=font_size,
+                                fontweight=('bold' if is_matched else 'normal'),
+                                color=CAT_COLORS.get('gaia','black'))
 
                 # If there are more rows than fit, add a small ellipsis line
                 if len(rows_limited) < len(raw_rows):
@@ -2198,6 +2253,54 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     sep_to_show = (closest_sep_pm_arcsec
                                    if closest_sep_pm_arcsec is not None else nearest_sep_arcsec)
                     title += f" — closest={sep_to_show:.2f}″"
+            # Decide if this panel is problematic and mark it visibly
+            try:
+                if 'gaia_id' in combined_df.columns:
+                    num_valid_master = int(np.sum((combined_df.loc[master_indices, 'gaia_id'].astype(float) != -1)
+                                                  & (~combined_df.loc[master_indices, 'gaia_id'].isna()))) if master_indices else 0
+                else:
+                    num_valid_master = len(master_indices)
+            except Exception:
+                num_valid_master = len(master_indices) if master_indices else 0
+
+            try:
+                near_thr = float(max(3.0, float(oth_min_plot[j])))
+            except Exception:
+                near_thr = 3.0
+            try:
+                near_sep = float(closest_sep_pm_arcsec) if (closest_sep_pm_arcsec is not None) else (float(nearest_sep_arcsec) if (nearest_sep_arcsec is not None) else None)
+            except Exception:
+                near_sep = None
+            close_count = 0
+            try:
+                if master_indices:
+                    for _m in master_indices:
+                        if 'gaia_id' in combined_df.columns and (pd.isna(combined_df.iloc[_m].get('gaia_id', np.nan))
+                                                                or combined_df.iloc[_m].get('gaia_id', -1) == -1):
+                            continue
+                        d_arcsec = float(np.hypot(dx_src.iloc[_m], dy_src.iloc[_m]))
+                        if d_arcsec <= near_thr:
+                            close_count += 1
+            except Exception:
+                pass
+            is_problem = False
+            if (num_valid_master == 0 and (near_sep is not None) and (near_sep <= near_thr)):
+                is_problem = True
+            elif (num_valid_master >= 1 and close_count >= 2):
+                is_problem = True
+            if is_problem:
+                try:
+                    for sp in ax.spines.values():
+                        sp.set_linewidth(2.0)
+                        sp.set_edgecolor('#d62728')
+                except Exception:
+                    pass
+                try:
+                    ax.text(0.02, 0.02, '⚠', transform=ax.transAxes, ha='left', va='bottom',
+                            fontsize=18, color='#d62728', fontweight='bold', zorder=20,
+                            bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='#d62728', lw=1.2, alpha=0.9))
+                except Exception:
+                    pass
             ax.set_title(title, pad=10)
 
             ax.set_xlim(-margin, margin)
@@ -2258,6 +2361,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
 
                     # Build a DS9 region content for the panel overlays (fk5)
                     reg = []
+                    reg.append('# Region file format: DS9')
+                    reg.append('global color=green dashlist=8 3 width=2 font="helvetica 10 normal roman" select=1 highlite=1 dash=0 fixed=0 edit=1 move=1 delete=1 include=1 source=1')
                     reg.append('fk5')
                     # New catalog ellipse (match-mode scaled)
                     reg.append(
@@ -2301,7 +2406,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     with open(reg_path, 'w') as f:
                         f.write('\n'.join(reg) + '\n')
 
-                    # Build a minimal Aladin script: load survey, center, fov, and the region overlay
+                    # Build a minimal Aladin script: center, FoV, and overlay planes
                     survey_aladin = {
                         '2MASS': 'CDS/P/2MASS/J',
                         'wise': 'CDS/P/AllWISE/Color',
@@ -2316,10 +2421,20 @@ def plot_after_merge(combined_df: pd.DataFrame,
 
                     # Build colorized overlays via Aladin draw commands in separate planes
                     # First, remove previous planes (if any) for idempotent refresh
+                    # Remove any overlays created by previous clicks
                     ajs.append('rm "aladin_*_ellipse"')
                     ajs.append('rm "aladin_*_gaia"')
+                    ajs.append('rm "aladin_*"')
                     ajs.append(f'rm "{base}_ellipse"')
                     ajs.append(f'rm "{base}_gaia"')
+                    # Also try to remove a previously loaded region file plane (both full path and basename)
+                    try:
+                        _reg_base = os.path.basename(reg_path)
+                    except Exception:
+                        _reg_base = ''
+                    if _reg_base:
+                        ajs.append(f'rm "{_reg_base}"')
+                    ajs.append(f'rm "{reg_path}"')
                     # Plane 1: ellipse for the new/other catalog source (green)
                     ajs.append(f'draw newtool("{base}_ellipse")')
                     ajs.append(
@@ -2366,6 +2481,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                                    % (r_g, d_g, r_g + dra_deg, d_g + ddec_deg))
                                     except Exception:
                                         pass
+                    # Optional: load the DS9 region file (can re-introduce accumulation in some Aladin versions)
+                    if str(os.environ.get('ALADIN_LOAD_REG', '0')).lower() in ('1','true','yes','on'):
+                        ajs.append(f'load "{reg_path}"')
+                        ajs.append('sync')
                     with open(ajs_path, 'w') as f:
                         f.write('\n'.join(ajs) + '\n')
 
@@ -2552,6 +2671,45 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     except Exception:
                         pass
 
+                    # Determine if this panel is potentially problematic
+                    try:
+                        # Count valid master components (with Gaia id)
+                        if 'gaia_id' in combined_df.columns:
+                            num_valid_master = int(np.sum((combined_df.loc[master_indices, 'gaia_id'].astype(float) != -1) & (~combined_df.loc[master_indices, 'gaia_id'].isna()))) if master_indices else 0
+                        else:
+                            num_valid_master = len(master_indices)
+                    except Exception:
+                        num_valid_master = len(master_indices) if master_indices else 0
+                    # Use nearest separation (PM-corrected if available)
+                    try:
+                        near_sep = float(closest_sep_pm_arcsec) if (closest_sep_pm_arcsec is not None) else (float(nearest_sep_arcsec) if (nearest_sep_arcsec is not None) else None)
+                    except Exception:
+                        near_sep = None
+                    # Threshold: larger of 3" and the new-source minor axis
+                    try:
+                        near_thr = float(max(3.0, float(oth_min_plot[j])))
+                    except Exception:
+                        near_thr = 3.0
+                    # If there are multiple nearby masters within threshold, count them
+                    close_count = 0
+                    try:
+                        if master_indices:
+                            for _m in master_indices:
+                                # Skip synthetic rows if present
+                                if 'gaia_id' in combined_df.columns and (pd.isna(combined_df.iloc[_m].get('gaia_id', np.nan)) or combined_df.iloc[_m].get('gaia_id', -1) == -1):
+                                    continue
+                                d_arcsec = float(np.hypot(dx_src.iloc[_m], dy_src.iloc[_m]))
+                                if d_arcsec <= near_thr:
+                                    close_count += 1
+                    except Exception:
+                        pass
+                    is_problem = False
+                    # Problematic if: (no identifications and a nearby master) or (an identification exists and another close-by master is present)
+                    if (num_valid_master == 0 and (near_sep is not None) and (near_sep <= near_thr)):
+                        is_problem = True
+                    elif (num_valid_master >= 1 and close_count >= 2):
+                        is_problem = True
+
                     # Save an entry for the HTML index
                     try:
                         index_rows.append({
@@ -2569,6 +2727,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             'ax_index': ax_idx,
                             'aladin': file_url,
                             'lite': url,
+                            'problem': 1 if is_problem else 0,
                         })
                     except Exception:
                         pass
@@ -2683,11 +2842,35 @@ def plot_after_merge(combined_df: pd.DataFrame,
             except Exception:
                 pass
             page_num = (start // per_page) + 1
-            png_name = f'{key}_page{page_num}.png'
+            # HTML emission mode: all | problems | none (env: ALADIN_HTML_MODE)
+            try:
+                _html_mode = str(os.environ.get('ALADIN_HTML_MODE', 'all')).strip().lower()
+            except Exception:
+                _html_mode = 'all'
+            if _html_mode not in ('all', 'problems', 'problem', 'problem-only', 'none'):
+                _html_mode = 'all'
+            page_has_problem = any(bool(a.get('problem')) for a in page_areas) if page_areas else False
+            skip_html = (_html_mode == 'none') or (_html_mode in ('problems', 'problem', 'problem-only') and not page_has_problem)
+
+            # Choose raster format for HTML image (env: HTML_IMAGE_FORMAT = png|jpg|webp)
+            try:
+                _imgfmt = str(os.environ.get('HTML_IMAGE_FORMAT', 'jpg')).strip().lower()
+            except Exception:
+                _imgfmt = 'jpg'
+            if _imgfmt in ('jpg', 'jpeg'):
+                _ext = 'jpg'
+                _imgfmt = 'jpg'
+            elif _imgfmt in ('webp',):
+                _ext = 'webp'
+                _imgfmt = 'webp'
+            else:
+                _ext = 'png'
+                _imgfmt = 'png'
+            png_name = f'{key}_page{page_num}.{_ext}'
             png_path = os.path.join(html_dir, png_name)
             html_name = f'{key}_page{page_num}.html'
             html_path = os.path.join(html_dir, html_name)
-            # Save figure to PNG at a consistent DPI
+            # Save figure to raster at a consistent DPI
             HTML_DPI = int(str(os.environ.get('HTML_DPI', '150')))
             # Display scale for HTML (e.g., 0.7 makes it 30% smaller)
             try:
@@ -2695,6 +2878,14 @@ def plot_after_merge(combined_df: pd.DataFrame,
             except Exception:
                 HTML_SCALE = 0.7
             HTML_SCALE = max(0.2, min(2.0, HTML_SCALE))
+            # Additional raster downscale factor relative to on-page display size.
+            # For example, 0.5 saves the image at half the displayed resolution
+            # (browser will upscale to display size), greatly reducing file size.
+            try:
+                HTML_RASTER_SCALE = float(str(os.environ.get('HTML_RASTER_SCALE', '0.8')))
+            except Exception:
+                HTML_RASTER_SCALE = 0.8
+            HTML_RASTER_SCALE = max(0.2, min(1.0, HTML_RASTER_SCALE))
             # Ensure layout is finalized first (so text bboxes match saved PNG), then save
             try:
                 # Hide in-figure link labels for PNG (HTML uses overlay buttons)
@@ -2711,7 +2902,36 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 fig.set_dpi(HTML_DPI)
             except Exception:
                 pass
-            fig.savefig(png_path, dpi=HTML_DPI)
+            # Save raster (respect format/quality); skip if HTML is disabled for this page
+            if not skip_html:
+                try:
+                    # Compute the actual save DPI to cap resolution:
+                    # save_dpi = HTML_DPI * HTML_SCALE (display size) * HTML_RASTER_SCALE (extra downscale)
+                    dpi_out = int(max(50, round(HTML_DPI * HTML_SCALE * HTML_RASTER_SCALE)))
+                    if _imgfmt == 'jpg':
+                        try:
+                            _q = int(str(os.environ.get('HTML_JPEG_QUALITY', '80')))
+                        except Exception:
+                            _q = 80
+                        _q = max(20, min(95, _q))
+                        fig.savefig(png_path, dpi=dpi_out, format='jpg', pil_kwargs={'quality': _q, 'optimize': True, 'progressive': True})
+                    elif _imgfmt == 'webp':
+                        try:
+                            _q = int(str(os.environ.get('HTML_WEBP_QUALITY', '80')))
+                        except Exception:
+                            _q = 80
+                        _q = max(30, min(95, _q))
+                        fig.savefig(png_path, dpi=dpi_out, format='webp', pil_kwargs={'quality': _q, 'method': 6})
+                    else:
+                        fig.savefig(png_path, dpi=dpi_out)
+                except TypeError:
+                    # Older Matplotlib without pil_kwargs support
+                    if _imgfmt == 'jpg':
+                        fig.savefig(png_path, dpi=dpi_out, format='jpg')
+                    elif _imgfmt == 'webp':
+                        fig.savefig(png_path, dpi=dpi_out, format='webp')
+                    else:
+                        fig.savefig(png_path, dpi=dpi_out)
             fig_w = int(fig.get_size_inches()[0] * HTML_DPI)
             fig_h = int(fig.get_size_inches()[1] * HTML_DPI)
             disp_w = int(fig_w * HTML_SCALE)
@@ -2760,6 +2980,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 right_y2 = min(ax_bot, right_y1 + BTN_H)
                 al_rect = (left_x1, left_y1, left_x2, left_y2)
                 lite_rect = (right_x1, right_y1, right_x2, right_y2)
+                # Full panel rectangle (entire axes region)
+                panel_rect = (ax_l, ax_top, ax_r, ax_bot)
 
                 areas.append({
                     'base': area['base'],
@@ -2773,6 +2995,17 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     'coords': lite_rect,
                     'href': area['lite'],
                 })
+                # Add a panel overlay for skip/filter UI and problem flag
+                try:
+                    areas.append({
+                        'base': area.get('base',''),
+                        'type': 'panel',
+                        'coords': panel_rect,
+                        'href': '',
+                        'problem': int(area.get('problem', 0)),
+                    })
+                except Exception:
+                    pass
             # Write page HTML
             map_name = f"map_{key}_{page_num}"
             lines = [
@@ -2803,11 +3036,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 if prev_name:
                     lines.append(' | ')
                 lines.append(f'<a href="{next_name}">Next Page »</a>')
-            # Keyboard usage hint in the top nav
-            lines.append('<span style="opacity:.7;margin-left:8px">Keyboard: ←/→ pages, ↑/↓ FOV, "a" Aladin</span>')
-            # Zoom controls
-            lines.append(' | <a href="#" onclick="return zoomStep(1/1.5)" title="Zoom out">Zoom −</a>')
-            lines.append(' | <a href="#" onclick="return zoomStep(1.5)" title="Zoom in">Zoom +</a>')
+            # Keyboard usage hint in the top nav + filter toggle
+            lines.append('<span style="opacity:.7;margin-left:8px">Keyboard: ←/→ pages, "a" Aladin</span>')
+            lines.append(' | <label><input type="checkbox" id="only_prob"> Show only to-check</label>')
             # Top-right link to go back one level (master index)
             lines.append('<span style="float:right"><a href="../../aladin_index.html" title="Back to index">Back</a></span>')
             # Jump-to-page form
@@ -2844,10 +3075,22 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         f'href="{default_http}" target="aladin_sink" data-ajs="{base_ajs}" onclick="return runSamp(event,this);" title="Aladin">Aladin</a>'
                     )
                     aladin_items_js.append(base_ajs)
-                else:
+                elif a['type'] == 'lite':
                     lines.append(
                         f'<a class="btn lite" style="left:{lp:.3f}%;top:{tp:.3f}%;width:{wp:.3f}%;height:{hp:.3f}%;" '
                         f'href="{href}" title="Aladin Lite" target="_blank" rel="noopener">Aladin&nbsp;Lite</a>'
+                    )
+                elif a['type'] == 'panel':
+                    # Add panel overlay container with skip checkbox and mask for filtering
+                    base_id = a.get('base', '')
+                    prob = int(a.get('problem', 0))
+                    lines.append(
+                        f'<div class="panelbox" data-base="{base_id}" data-problem="{prob}" '
+                        f'style="position:absolute;left:{lp:.3f}%;top:{tp:.3f}%;width:{wp:.3f}%;height:{hp:.3f}%;z-index:8;">'
+                        f'<input type="checkbox" class="skipbox" data-base="{base_id}" title="Skip" '
+                        f'style="position:absolute;left:50%;top:4px;transform:translateX(-50%);z-index:12;" onclick="return toggleSkip(this);" />'
+                        f'<div class="mask" style="display:none;position:absolute;left:0;top:0;width:100%;height:100%;background:rgba(255,255,255,0.85);"></div>'
+                        f'</div>'
                     )
             lines.append('</div>')
             # JS helper to call local SAMP link server when available
@@ -2856,6 +3099,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 f'const ALADIN_ITEMS = {aladin_items_js!s};\n'
                 'const SAMP_URL = (window.localStorage && localStorage.getItem("ALADIN_LINK_URL")) || "http://127.0.0.1:8765";\n'
                 f'const PAGE_KEY = {key!r}; const PAGE_NUM = {page_num}; const TOTAL_PAGES = {total_pages};\n'
+                'try{ window.PAGE_KEY = PAGE_KEY; window.PAGE_NUM = PAGE_NUM; window.TOTAL_PAGES = TOTAL_PAGES; }catch(e){}\n'
                 'function _baseUrl(u){ try{ return (u && u.endsWith && u.endsWith("/")) ? u.slice(0,-1) : u; }catch(e){ return u; } }\n'
                 'function runSamp(ev, el){\n'
                 '  try{\n'
@@ -2879,13 +3123,28 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 '  try{ const base = _baseUrl(SAMP_URL); const url = base + "/run_samp?file=" + encodeURIComponent(ajs); await fetch(url); }catch(e){}\n'
                 '  return false;\n'
                 '}\n'
+                '// Panel filtering and skip controls\n'
+                'function _readSkip(){ try{ const k = "SKIP_"+PAGE_KEY; const s = localStorage.getItem(k); return s? JSON.parse(s) : {}; }catch(e){ return {}; } }\n'
+                'function _writeSkip(obj){ try{ const k = "SKIP_"+PAGE_KEY; localStorage.setItem(k, JSON.stringify(obj)); }catch(e){} }\n'
+                'function _readOnly(){ try{ const k = "ONLY_PROB_"+PAGE_KEY; return localStorage.getItem(k)==='+'"1"'+'; }catch(e){ return false; } }\n'
+                'function _writeOnly(v){ try{ const k = "ONLY_PROB_"+PAGE_KEY; localStorage.setItem(k, v?"1":"0"); }catch(e){} }\n'
+                'function toggleSkip(cb){ try{ const base = cb.getAttribute("data-base"); if(!base) return false; const sk=_readSkip(); if(cb.checked){ sk[base]=1; } else { delete sk[base]; } _writeSkip(sk); const pb = cb.closest(".panelbox"); if(pb){ pb.setAttribute("data-skip", cb.checked?"1":"0"); } updatePanels(); }catch(e){} return true; }\n'
+                'function updatePanels(){ try{ const only = document.getElementById("only_prob"); const onlyOn = !!(only && only.checked); const pb = document.querySelectorAll(".panelbox"); pb.forEach(function(p){ const prob = p.getAttribute("data-problem")==="1"; const skip = p.getAttribute("data-skip")==="1"; const mask = p.querySelector(".mask"); let show = true; if(onlyOn){ show = prob && !skip; } else { show = !skip; } if(mask){ mask.style.display = show? "none" : "block"; } }); }catch(e){} return false; }\n'
+                'function _hasUnskippedProblems(){ try{ const pb = document.querySelectorAll(".panelbox"); for(let i=0;i<pb.length;i++){ const p=pb[i]; if(p.getAttribute("data-problem")==="1" && p.getAttribute("data-skip")!=="1"){ return true; } } }catch(e){} return false; }\n'
+                'function _getSeek(){ try{ const h=String(location.hash||""); const m=h.match(/seek=(next|prev)/); return m? m[1] : "next"; }catch(e){ return "next"; } }\n'
+                'function _navToPage(n, dir){ if(typeof TOTAL_PAGES!=="number") return; if(n<1||n>TOTAL_PAGES) return; const href = PAGE_KEY + "_page" + n + ".html#seek=" + (dir||"next"); location.href = href; }\n'
+                'function _maybeAutoAdvance(){ try{ const onlyOn = _readOnly(); if(!onlyOn) return; if(_hasUnskippedProblems()) return; const dir = _getSeek(); if(dir==="prev"){ if(PAGE_NUM>1){ _navToPage(PAGE_NUM-1, "prev"); } } else { if(PAGE_NUM<TOTAL_PAGES){ _navToPage(PAGE_NUM+1, "next"); } } }catch(e){} }\n'
+                'document.addEventListener("DOMContentLoaded", function(){ try{ const sk=_readSkip(); document.querySelectorAll(".panelbox").forEach(function(p){ const b=p.getAttribute("data-base"); if(sk[b]){ p.setAttribute("data-skip","1"); const cb=p.querySelector(".skipbox"); if(cb) cb.checked=true; } }); const only=document.getElementById("only_prob"); if(only){ only.checked = _readOnly(); only.addEventListener("change", function(){ _writeOnly(only.checked); updatePanels(); if(only.checked){ _navToPage(PAGE_NUM, _getSeek()); } }); } updatePanels(); // tag Prev/Next anchors with seek\n'
+                '  document.querySelectorAll(".nav a").forEach(function(a){ const t=(a.textContent||"").toLowerCase(); if(t.indexOf("next page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=next"; } if(t.indexOf("prev page")!==-1 || t.indexOf("« prev page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=prev"; } }); _maybeAutoAdvance(); }catch(e){} });\n'
                 '</script>'
             ]
             # Remove bottom per-source nav (was unreliable without local server)
             lines.append('<script src="nav_keys.js"></script>')
-            with open(html_path, 'w') as f:
-                f.write('\n'.join(lines) + '\n')
-            page_files.append(os.path.join('html', html_name))
+            # Only write HTML if not skipped
+            if not skip_html:
+                with open(html_path, 'w') as f:
+                    f.write('\n'.join(lines) + '\n')
+                page_files.append(os.path.join('html', html_name))
         except Exception as e:
             print(f"[html] Failed to write page HTML: {e}")
 
@@ -2955,7 +3214,7 @@ def main() -> None:
     }
     # Define the central coordinate of NGC 2264 and search radius
     center = SkyCoord(ra=100.25 * u.deg, dec=9.883333 * u.deg, frame='icrs')
-    radius = 0.02 * u.deg
+    radius = 1.0 * u.deg
 
     print("Querying Gaia DR3 ...")
     gaia = query_gaia(center, radius)
@@ -3179,15 +3438,29 @@ def main() -> None:
     combined_df.to_csv('ngc2264_combined.csv', index=False)
     print(f"Master catalog written to ngc2264_combined.csv ({len(combined_df)} rows)")
 
-    # Write a master HTML index that links directly to page 1 for each catalog
+    # Write a master HTML index that links to the first existing page for each catalog
     try:
         scripts_dir = os.environ.get('ALADIN_SCRIPTS_DIR', 'aladin_scripts')
         first_pages = []
         html_dir = os.path.join(scripts_dir, 'html')
         if os.path.isdir(html_dir):
-            for name in sorted(os.listdir(html_dir)):
-                if name.endswith('_page1.html'):
-                    first_pages.append(name)
+            try:
+                import re
+                first_map = {}
+                for name in sorted(os.listdir(html_dir)):
+                    m = re.match(r"^(.*)_page(\d+)\.html$", name)
+                    if not m:
+                        continue
+                    prefix = m.group(1)
+                    n = int(m.group(2))
+                    if (prefix not in first_map) or (n < first_map[prefix][0]):
+                        first_map[prefix] = (n, name)
+                first_pages = [v[1] for k, v in sorted(first_map.items(), key=lambda kv: kv[0].lower())]
+            except Exception:
+                # Fallback to page 1 only
+                for name in sorted(os.listdir(html_dir)):
+                    if name.endswith('_page1.html'):
+                        first_pages.append(name)
         if first_pages:
             lines = [
                 '<!doctype html>',
@@ -3207,6 +3480,196 @@ def main() -> None:
             print('[index] Wrote aladin_index.html')
     except Exception as e:
         print(f"[index] Could not write master HTML index: {e}")
+    return combined_df, catalogs
+
+
+def build_data_for_web(refresh: bool = False,
+                       chandra_csv_path: str = '/Users/ettoref/ASTRONOMY/DATA/N2264_XMM_alt/N2264_acis12.csv',
+                       include_catalogs=None):
+    """Prepare combined_df and catalogs for the dynamic web server without
+    writing PDFs or HTML pages. Reuses the same query and matching logic as
+    main(), but stops after producing the merged catalog in memory.
+
+    Parameters
+    ----------
+    refresh : bool
+        If True, ignore local caches when querying catalogs.
+    chandra_csv_path : str
+        Path to pre-exported Chandra CSV with columns ra_deg, dec_deg, epos/pub_n.
+
+    Returns
+    -------
+    (combined_df, catalogs)
+        The merged DataFrame and the per-catalog metadata dict used by plotting.
+    """
+    global REFRESH
+    REFRESH = bool(refresh)
+    # Per-catalog parameters: factor and min_radius (arcsec)
+    catalog_params = {
+        'gaia':    {'factor': 2.0, 'min_radius': 0.05, 'epoch': 2016.0},
+        '2MASS':   {'factor': 2.0, 'min_radius': 0.10, 'epoch': 2000.0},
+        'wise':    {'factor': 2.0, 'min_radius': 1.00, 'epoch': 2010.5},
+        'chandra': {'factor': 2.0, 'min_radius': 5.00, 'epoch': 2002.0},
+        'xmm':     {'factor': 2.0, 'min_radius': 5.00, 'epoch': 2003.0}
+    }
+    # Normalize include list
+    include_set = None
+    if include_catalogs is not None:
+        try:
+            if isinstance(include_catalogs, str):
+                include_catalogs = [include_catalogs]
+            include_set = set([str(x).strip().lower() for x in include_catalogs if str(x).strip()])
+        except Exception:
+            include_set = None
+    center = SkyCoord(ra=100.25 * u.deg, dec=9.883333 * u.deg, frame='icrs')
+    radius = 1.00 * u.deg
+
+    gaia = query_gaia(center, radius)
+    gaia = filter_gaia_quality(gaia)
+    tmass = wise = chan = xmm = None
+    if (include_set is None) or ('2mass' in include_set or '2mass_j' in include_set or '2mass-j' in include_set or '2MASS' in (include_catalogs if include_catalogs else [])):
+        tmass = query_2mass(center, radius)
+        tmass = filter_2mass_quality(tmass)
+    if (include_set is None) or ('wise' in include_set):
+        wise = query_wise(center, radius)
+        wise = filter_wise_quality(wise)
+    if (include_set is None) or ('chandra' in include_set):
+        chan = query_chandra_csv(center, radius, csv_path=chandra_csv_path)
+        chan = filter_chandra_quality(chan)
+    if (include_set is None) or ('xmm' in include_set):
+        xmm  = query_xmm(center, radius)
+        xmm  = filter_xmm_quality(xmm)
+
+    combined_df = gaia.copy()
+    gp = catalog_params['gaia']
+    combined_df['errMaj'] *= gp['factor']
+    combined_df['errMin'] *= gp['factor']
+    combined_df['errMaj'] = combined_df['errMaj'].clip(lower=gp['min_radius'])
+    combined_df['errMin'] = combined_df['errMin'].clip(lower=gp['min_radius'])
+
+    catalogs: dict[str, object] = {}
+    gaia_cols_base = ['ra_deg','dec_deg','errMaj','errMin','errPA']
+    gaia_cols_pm = ['pmra','pmdec','pmra_error','pmdec_error','ref_epoch']
+    gaia_cols = gaia_cols_base + [c for c in gaia_cols_pm if c in gaia.columns]
+    catalogs['gaia'] = {
+        'data': gaia.set_index('gaia_id')[gaia_cols],
+        'frame': gaia.copy(),
+        **catalog_params['gaia']
+    }
+
+    for df_other, id_col in [
+        (tmass,     '2MASS'),
+        (wise,      'wise_id'),
+        (chan,      'chandra_id'),
+        (xmm,       'xmm_id'),
+    ]:
+        if df_other is None:
+            continue
+        key = id_col.replace('_id', '')
+        params = catalog_params[key]
+        cols: list[str] = ['ra_deg', 'dec_deg']
+        for ellipse in ['errMaj', 'errMin', 'errPA']:
+            if ellipse in df_other.columns:
+                cols.append(ellipse)
+        catalogs[key] = {
+            'data': df_other.set_index(id_col)[cols],
+            'frame': df_other.copy(),
+            **params
+        }
+        # Cross-match and merge (same logic as main, minus plotting/PDF)
+        matches = cross_match(
+            combined_df, df_other, id_col,
+            min_radius = params['min_radius'] * u.arcsec,
+            pdf_path   = None,
+            scale_factor = params['factor'],
+            all_catalogs = catalogs,
+            plot_mode = 'match'
+        )
+        # Initialize id column with the same dtype and sentinel
+        col_dtype = df_other[id_col].dtype
+        sentinel: object
+        if getattr(col_dtype, "kind", None) in ("i", "u", "f"):
+            sentinel = -1
+        else:
+            sentinel = None
+        combined_df[id_col] = pd.Series([sentinel] * len(combined_df),
+                                         index=combined_df.index,
+                                         dtype=col_dtype)
+        rows_to_append: list[dict] = []
+        df_other_indexed = df_other.set_index(id_col)
+        for i in combined_df.index:
+            matched_ids = matches[i]
+            if not matched_ids:
+                continue
+            first_oid = matched_ids[0]
+            other_row = df_other_indexed.loc[first_oid]
+            scaled_maj = max(other_row['errMaj'] * params['factor'], params['min_radius'])
+            scaled_min = max(other_row['errMin'] * params['factor'], params['min_radius'])
+            scaled_pa  = other_row['errPA']
+            if scaled_maj < combined_df.at[i, 'errMaj']:
+                combined_df.at[i, 'ra_deg'] = other_row['ra_deg']
+                combined_df.at[i, 'dec_deg'] = other_row['dec_deg']
+                combined_df.at[i, 'errMaj']  = scaled_maj
+                combined_df.at[i, 'errMin']  = scaled_min
+                combined_df.at[i, 'errPA']   = scaled_pa
+            combined_df.at[i, id_col] = first_oid
+            for oid in matched_ids[1:]:
+                try:
+                    lookup_key = int(oid)
+                except ValueError:
+                    lookup_key = oid
+                other_row = df_other_indexed.loc[lookup_key]
+                scaled_maj = max(other_row['errMaj'] * params['factor'], params['min_radius'])
+                scaled_min = max(other_row['errMin'] * params['factor'], params['min_radius'])
+                scaled_pa  = other_row['errPA']
+                entry = {
+                    'ra_deg': other_row['ra_deg'],
+                    'dec_deg': other_row['dec_deg'],
+                    'errMaj': min(combined_df.at[i, 'errMaj'], scaled_maj),
+                    'errMin': min(combined_df.at[i, 'errMin'], scaled_min),
+                    'errPA':  scaled_pa,
+                }
+                entry.update({c: combined_df.at[i, c] for c in ['gaia_id','2MASS','wise_id','chandra_id','xmm_id'] if c in combined_df.columns})
+                entry[id_col] = lookup_key
+                rows_to_append.append(entry)
+        # Append synthetic rows for unmatched others
+        rev_matches = cross_match(
+            df_other, combined_df, id_col,
+            min_radius = params['min_radius'] * u.arcsec,
+            pdf_path   = None,
+            scale_factor = params['factor'],
+            all_catalogs = catalogs,
+            plot_mode = 'match'
+        )
+        for j, ids in enumerate(rev_matches):
+            if not ids:
+                other_row = df_other.iloc[j]
+                maj = max(other_row['errMaj'] * params['factor'], params['min_radius'])
+                min_ = max(other_row['errMin'] * params['factor'], params['min_radius'])
+                pa = other_row['errPA']
+                entry = {
+                    'ra_deg': other_row['ra_deg'],
+                    'dec_deg': other_row['dec_deg'],
+                    'errMaj': maj,
+                    'errMin': min_,
+                    'errPA': pa,
+                    id_col: other_row[id_col],
+                    'gaia_id': -1
+                }
+                rows_to_append.append(entry)
+        if rows_to_append:
+            combined_df = pd.concat([combined_df, pd.DataFrame(rows_to_append)], ignore_index=True)
+        if id_col == '2MASS':
+            combined_df = attach_2mass_blends(
+                combined_df, df_other,
+                r_group_arcsec=1.5,
+                max_pair_sep_arcsec=2.0,
+                r_centroid_arcsec=0.7,
+                max_dG_mag=2.0,
+                prefer_blflag=True
+            )
+            combined_df = _dedupe_unmatched_for_id(combined_df, id_col)
+
     return combined_df, catalogs
 
 
