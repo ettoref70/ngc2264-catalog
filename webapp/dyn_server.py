@@ -19,6 +19,8 @@ import cross_match_ngc2264 as cm  # type: ignore
 from aladin_link_server import run_samp_script  # type: ignore
 SCRIPTS_DIR = (BASE_DIR / "aladin_scripts").resolve()
 HTML_DIR = (SCRIPTS_DIR / "html").resolve()
+EDITS_DIR = (BASE_DIR / "edits").resolve()
+EDITS_PATH = (EDITS_DIR / "links.json").resolve()
 
 
 def _is_safe_path(root: Path, target: Path) -> bool:
@@ -34,7 +36,8 @@ def create_app() -> Flask:
     app = Flask(__name__)
 
     # Cache datasets per requested catalog key (e.g., '2MASS', 'wise')
-    DATA: Dict[str, tuple] = {}
+    # Each entry keeps the pre-edit baseline so we can reapply edits quickly.
+    DATA: Dict[str, Dict[str, object]] = {}
 
     def _try_build_from_combined(key: str):
         import pandas as _pd
@@ -80,18 +83,69 @@ def create_app() -> Flask:
 
     def _load_data_for_key(key: str):
         # Return cached subset if present
-        if key in DATA:
-            return DATA[key]
+        entry = DATA.get(key)
+        if entry:
+            return entry['combined'], entry['catalogs']
         # Build from queries/caches to ensure per-catalog ellipses and positions are correct.
         refresh = (os.environ.get('DYN_REFRESH', '0') in ('1', 'true', 'yes'))
-        include = ['gaia', '2MASS'] if key.lower() in ('2mass', '2mass_j', '2massj') else ['gaia', key]
+        # By default, dynamic pages should mirror the PDF for that catalog:
+        # include only Gaia + previous catalogs up to and including `key` in the
+        # merge order used by main(): [2MASS, wise, chandra, xmm].
+        # You can override with DYN_INCLUDE_CATALOGS=gaia,2MASS,... if desired.
+        inc_env = os.environ.get('DYN_INCLUDE_CATALOGS')
+        if inc_env:
+            include = [s.strip() for s in inc_env.split(',') if s.strip()]
+        else:
+            order = ['gaia', '2MASS', 'wise', 'chandra', 'xmm']
+            k_norm = key.strip()
+            # Normalize some aliases
+            if k_norm.lower() in ('2mass', '2mass_j', '2massj'):
+                k_norm = '2MASS'
+            # Find position; if not found, default to Gaia only
+            try:
+                pos = order.index(k_norm)
+            except ValueError:
+                pos = 0
+            include = order[:pos+1]
+        # Optional radius override from environment (degrees)
+        _r_env = os.environ.get('DYN_RADIUS_DEG')
+        try:
+            _r_val = float(_r_env) if _r_env is not None else None
+        except Exception:
+            _r_val = None
+        # Load edit links and pass to builder
+        try:
+            import json as _json
+            if EDITS_PATH.exists():
+                with open(EDITS_PATH, 'r') as f:
+                    edits = _json.load(f)
+            else:
+                edits = {}
+        except Exception:
+            edits = {}
+
         combined_df, catalogs = cm.build_data_for_web(refresh=refresh,
                                                       chandra_csv_path=os.environ.get('CHANDRA_CSV_PATH', '/Users/ettoref/ASTRONOMY/DATA/N2264_XMM_alt/N2264_acis12.csv'),
-                                                      include_catalogs=include)
-        DATA[key] = (combined_df, catalogs)
-        return DATA[key]
+                                                      include_catalogs=include,
+                                                      radius_deg=_r_val,
+                                                      edits=edits)
+        baseline_df = combined_df.attrs.get('_baseline_unforced')
+        if baseline_df is None:
+            try:
+                baseline_df = combined_df.copy(deep=True)
+            except Exception:
+                baseline_df = combined_df
+        DATA[key] = {
+            'combined': combined_df,
+            'baseline': baseline_df,
+            'catalogs': catalogs,
+        }
+        return combined_df, catalogs
 
     def _ensure_pages_for(key: str, page_num: int, *, draw_images: bool | None = None) -> None:
+        # Respect existing PDF_DEBUG_D2 setting; default to '0' (overlay off)
+        if 'PDF_DEBUG_D2' not in os.environ:
+            os.environ['PDF_DEBUG_D2'] = '0'
         combined_df, catalogs = _load_data_for_key(key)
         if key not in catalogs:
             abort(404)
@@ -177,6 +231,9 @@ def create_app() -> Flask:
     def page(key: str, page: int):
         # Ensure that static HTML pages exist for this catalog; then serve the requested page
         want_img = request.args.get('img', '').lower() in ('1','true','yes','on')
+        debug_arg = request.args.get('debug')
+        if debug_arg is not None:
+            os.environ['PDF_DEBUG_D2'] = '1' if debug_arg.lower() in ('1', 'true', 'yes', 'on') else '0'
         _ensure_pages_for(key, page, draw_images=want_img or None)
         fname = f"{key}_page{page}.html"
         fpath = HTML_DIR / fname
@@ -197,6 +254,9 @@ def create_app() -> Flask:
             page_num = int(m.group(2))
             # Allow forcing image background via query param
             want_img = request.args.get('img', '').lower() in ('1','true','yes','on')
+            debug_arg = request.args.get('debug')
+            if debug_arg is not None:
+                os.environ['PDF_DEBUG_D2'] = '1' if debug_arg.lower() in ('1','true','yes','on') else '0'
             try:
                 _ensure_pages_for(key, page_num, draw_images=want_img or None)
             except Exception:
@@ -213,6 +273,154 @@ def create_app() -> Flask:
         if not _is_safe_path(SCRIPTS_DIR, fpath) or not fpath.exists():
             abort(404)
         return send_from_directory(SCRIPTS_DIR, subpath)
+
+    # Edit-link API: force/remove/toggle links between current catalog source and a master row
+    @app.route('/api/edit_link', methods=['GET', 'POST'])
+    def api_edit_link():
+        cat = (request.values.get('cat') or '').strip()
+        other = (request.values.get('id') or '').strip()
+        master = (request.values.get('master') or '').strip()
+        action = (request.values.get('action') or 'toggle').strip().lower()
+        row = (request.values.get('row') or '').strip()
+        page = int(request.values.get('page') or '1')
+        if not cat or not other or not master:
+            abort(400)
+        EDITS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            import json as _json
+            try:
+                data = _json.load(open(EDITS_PATH, 'r')) if EDITS_PATH.exists() else {}
+            except Exception:
+                data = {}
+            sect = data.get(cat) or {'force': [], 'remove': []}
+            data[cat] = sect
+            # Canonicalize known id formats from URLs that may collapse '+' into space
+            if cat == '2MASS' and ' ' in other and '+' not in other and '-' not in other:
+                other = other.replace(' ', '+')
+            # Helper to check presence
+            def _contains(lst, other_id, mkey):
+                for it in lst:
+                    if str(it.get('other')) == str(other_id) and str(it.get('master')) == str(mkey):
+                        return True
+                return False
+            # Parse master spec to locate the intended combined_df row(s)
+            def _parse_master(mkey: str):
+                try:
+                    pref, val = mkey.split(':', 1)
+                except ValueError:
+                    return None, None
+                p = pref.strip().lower()
+                cmap = {
+                    'gaia': 'gaia_id',
+                    '2mass': '2MASS', '2mass_j': '2MASS', '2massj': '2MASS', '2mass-j': '2MASS', '2massj-': '2MASS',
+                    '2mass_id': '2MASS', '2massj_id': '2MASS',
+                    'wise': 'wise_id',
+                    'chandra': 'chandra_id',
+                    'xmm': 'xmm_id',
+                }
+                col = cmap.get(p, None)
+                return col, val
+
+            # Determine real desired action on current dataset using the clicked row as primary hint:
+            # if (other) is attached on the hinted row -> remove; otherwise -> force on that row,
+            # regardless of attachments elsewhere.
+            if action == 'toggle':
+                try:
+                    # Load current in-memory dataset for this catalog (without applying the new edit yet)
+                    combined_df, catalogs = _load_data_for_key(cat)
+                    # Identify id column for the catalog
+                    id_col_map = {'2MASS': '2MASS', 'wise': 'wise_id', 'chandra': 'chandra_id', 'xmm': 'xmm_id'}
+                    id_col = id_col_map.get(cat, cat if cat in combined_df.columns else None)
+                    if id_col is None or id_col not in combined_df.columns:
+                        id_col = '2MASS' if cat == '2MASS' else (f"{cat}_id" if f"{cat}_id" in combined_df.columns else None)
+                    mcol, mval = _parse_master(master)
+                    # Resolve the hinted row (if valid and consistent with master key)
+                    hinted_row = None
+                    if row and row.isdigit():
+                        irow = int(row)
+                        if (irow >= 0) and (irow < len(combined_df)):
+                            hinted_row = irow
+                            # If a master column is specified, ensure the hint matches the same master
+                            if mcol and (mcol in combined_df.columns):
+                                try:
+                                    if str(combined_df.at[irow, mcol]) != str(mval):
+                                        hinted_row = None
+                                except Exception:
+                                    hinted_row = None
+                    # Evaluate attachment specifically on the hinted row
+                    attached_here = False
+                    if hinted_row is not None and id_col in combined_df.columns:
+                        try:
+                            attached_here = (str(combined_df.at[hinted_row, id_col]) == str(other))
+                        except Exception:
+                            attached_here = False
+                    # Decide action strictly based on the hinted row
+                    action = 'remove' if attached_here else 'force'
+                except Exception:
+                    # Fallback to legacy behaviour
+                    action = 'force'
+            # Apply action
+            if action == 'toggle':
+                # Legacy toggle: fall back to force/remove list flipping
+                if _contains(sect.get('force', []), other, master):
+                    sect['force'] = [it for it in sect.get('force', []) if not (str(it.get('other')) == str(other) and str(it.get('master')) == str(master))]
+                elif _contains(sect.get('remove', []), other, master):
+                    sect['remove'] = [it for it in sect.get('remove', []) if not (str(it.get('other')) == str(other) and str(it.get('master')) == str(master))]
+                else:
+                    rec = {'other': other, 'master': master}
+                    if row:
+                        rec['row'] = row
+                    sect.setdefault('force', []).append(rec)
+            elif action == 'force':
+                if not _contains(sect.get('force', []), other, master):
+                    rec = {'other': other, 'master': master}
+                    if row:
+                        rec['row'] = row
+                    sect.setdefault('force', []).append(rec)
+                # Remove any remove entry
+                sect['remove'] = [it for it in sect.get('remove', []) if not (str(it.get('other')) == str(other) and str(it.get('master')) == str(master))]
+            elif action == 'remove':
+                if not _contains(sect.get('remove', []), other, master):
+                    rec = {'other': other, 'master': master}
+                    if row:
+                        rec['row'] = row
+                    sect.setdefault('remove', []).append(rec)
+                # Remove any force entry
+                sect['force'] = [it for it in sect.get('force', []) if not (str(it.get('other')) == str(other) and str(it.get('master')) == str(master))]
+            # Persist
+            with open(EDITS_PATH, 'w') as f:
+                _json.dump(data, f, indent=2)
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}, 500
+
+        # Reapply edits to any cached combined tables so we do not rebuild
+        # every catalog after a manual force/remove action.
+        try:
+            for cache_key, entry in list(DATA.items()):
+                base_df = entry.get('baseline')  # type: ignore[assignment]
+                catalogs_entry = entry.get('catalogs')
+                if base_df is None or catalogs_entry is None:
+                    continue
+                try:
+                    updated = cm.apply_link_edits_to_combined(base_df, catalogs_entry, data)
+                except Exception:
+                    updated = base_df.copy(deep=True)
+                    updated.attrs['_baseline_unforced'] = base_df
+                entry['combined'] = updated
+        except Exception:
+            # On failure we simply allow a subsequent request to rebuild.
+            pass
+        # Redirect back to the page
+        return redirect(url_for('page', key=cat, page=page), code=302)
+
+    # Provide a compatibility route for the static index reference used by generated pages
+    @app.get('/aladin_index.html')
+    def serve_static_index():
+        # If a static aladin_index.html exists at project root, serve it; otherwise redirect to '/'
+        idx = (BASE_DIR / 'aladin_index.html')
+        if idx.exists():
+            return send_from_directory(str(BASE_DIR), 'aladin_index.html')
+        return redirect(url_for('index'), code=302)
 
     # Optional convenience: forward dynamic SAMP sends through this server
     @app.get('/run_samp')
@@ -235,8 +443,75 @@ def create_app() -> Flask:
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', '5050'))
-    host = os.environ.get('HOST', '127.0.0.1')
+    # Simple CLI for host/port and radius (falls back to environment variables)
+    import argparse
+    parser = argparse.ArgumentParser(description='Dynamic NGC 2264 pages server')
+    parser.add_argument('--host', default=os.environ.get('HOST', '127.0.0.1'),
+                        help='Host/IP to bind (default from HOST env or 127.0.0.1)')
+    parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', '5050')),
+                        help='Port to listen on (default from PORT env or 5050)')
+    parser.add_argument('--radius-deg', type=float, default=None,
+                        help='Cone search radius in degrees for all catalogs (overrides DYN_RADIUS_DEG env)')
+    parser.add_argument('--refresh', action='store_true', default=False,
+                        help='Ignore cached CSVs on first build (sets DYN_REFRESH=1)')
+    # Image/HTML rendering quality controls
+    parser.add_argument('--html-dpi', type=int, default=None,
+                        help='Figure DPI used for rasterization (env HTML_DPI)')
+    parser.add_argument('--html-scale', type=float, default=None,
+                        help='Display scale factor in HTML (env HTML_SCALE)')
+    parser.add_argument('--html-raster-scale', type=float, default=None,
+                        help='Additional raster downscale factor (env HTML_RASTER_SCALE)')
+    parser.add_argument('--html-image-format', choices=['png','jpg','jpeg','webp'], default=None,
+                        help='Raster format for page images (env HTML_IMAGE_FORMAT)')
+    parser.add_argument('--html-jpeg-quality', type=int, default=None,
+                        help='JPEG quality 20–95 (env HTML_JPEG_QUALITY)')
+    parser.add_argument('--html-webp-quality', type=int, default=None,
+                        help='WEBP quality 30–95 (env HTML_WEBP_QUALITY)')
+    # Background 2MASS J image resolution controls
+    parser.add_argument('--tmass-fetch', choices=['auto','hips','skyview','off'], default=None,
+                        help='Select image provider for 2MASS J backgrounds (env TMASS_FETCH)')
+    parser.add_argument('--tmass-arcsec-per-pix', type=float, default=None,
+                        help='2MASS J HiPS pixel scale in arcsec/pixel (env TMASS_ARCSEC_PER_PIX)')
+    parser.add_argument('--tmass-max-size', type=int, default=None,
+                        help='2MASS J HiPS maximum output size (px) (env TMASS_MAX_SIZE)')
+    parser.add_argument('--no-images', action='store_true', default=False,
+                        help='Disable background images (sets DYN_NO_IMAGES=1)')
+    args = parser.parse_args()
+
+    # Export CLI options to environment so downstream builder sees them
+    if args.radius_deg is not None:
+        os.environ['DYN_RADIUS_DEG'] = str(args.radius_deg)
+    if args.refresh:
+        os.environ['DYN_REFRESH'] = '1'
+    if args.no_images:
+        os.environ['DYN_NO_IMAGES'] = '1'
+    if args.html_dpi is not None:
+        os.environ['HTML_DPI'] = str(int(args.html_dpi))
+    if args.html_scale is not None:
+        os.environ['HTML_SCALE'] = str(float(args.html_scale))
+    if args.html_raster_scale is not None:
+        os.environ['HTML_RASTER_SCALE'] = str(float(args.html_raster_scale))
+    if args.html_image_format is not None:
+        os.environ['HTML_IMAGE_FORMAT'] = args.html_image_format
+    if args.html_jpeg_quality is not None:
+        os.environ['HTML_JPEG_QUALITY'] = str(int(args.html_jpeg_quality))
+    if args.html_webp_quality is not None:
+        os.environ['HTML_WEBP_QUALITY'] = str(int(args.html_webp_quality))
+    if args.tmass_fetch is not None:
+        os.environ['TMASS_FETCH'] = args.tmass_fetch
+    if args.tmass_arcsec_per_pix is not None:
+        os.environ['TMASS_ARCSEC_PER_PIX'] = str(float(args.tmass_arcsec_per_pix))
+    if args.tmass_max_size is not None:
+        os.environ['TMASS_MAX_SIZE'] = str(int(args.tmass_max_size))
+
+    # Set higher-quality defaults unless overridden by CLI or existing env
+    # These defaults match your preferred settings: 300 DPI, PNG, no extra downscale.
+    os.environ.setdefault('HTML_DPI', '300')
+    os.environ.setdefault('HTML_IMAGE_FORMAT', 'png')
+    os.environ.setdefault('HTML_RASTER_SCALE', '1.0')
+
+    port = int(args.port)
+    host = str(args.host)
     # Make sure the expected env for the generator points to our scripts dir
     os.environ.setdefault('ALADIN_SCRIPTS_DIR', str(SCRIPTS_DIR))
     app = create_app()
