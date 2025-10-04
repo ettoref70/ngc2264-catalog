@@ -425,13 +425,6 @@ def apply_link_edits_to_combined(base_df: 'pd.DataFrame',
             if not idxs:
                 continue
             target_idx = idxs[0]
-            # Clear existing placements of this identifier first
-            try:
-                mask_other = combined_df[id_col].astype(str) == str(other)
-            except Exception:
-                mask_other = _pd.Series([False] * len(combined_df))
-            if mask_other.any():
-                combined_df.loc[mask_other, id_col] = sentinel
             assign_val = _coerce_other(other, series)
             try:
                 combined_df.at[target_idx, id_col] = assign_val
