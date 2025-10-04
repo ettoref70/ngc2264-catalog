@@ -84,6 +84,7 @@ except ImportError as exc:
 
 
 import os
+from pathlib import Path
 # Directory to cache downloaded catalogs
 
 CACHE_DIR = "catalogs"
@@ -97,22 +98,71 @@ import argparse
 
 
 # -------------------- Edit-link helpers --------------------
-def _edits_path() -> str:
-    base = os.environ.get('EDIT_LINKS_PATH')
-    if base:
-        return base
+CURRENT_EDITS_RADIUS: float | None = None
+
+
+def _effective_radius(radius_deg: float | None = None) -> float | None:
+    if radius_deg is not None:
+        return radius_deg
     try:
-        os.makedirs('edits', exist_ok=True)
+        if CURRENT_EDITS_RADIUS is not None:
+            return float(CURRENT_EDITS_RADIUS)
     except Exception:
         pass
-    return os.path.join('edits', 'links.json')
+    for var in ('DYN_RADIUS_DEG', 'RADIUS_DEG', 'CURRENT_EDITS_RADIUS'):
+        val = os.environ.get(var)
+        if val is None:
+            continue
+        try:
+            return float(val)
+        except Exception:
+            continue
+    return None
 
 
-def _load_edits() -> Dict[str, Any]:
-    path = _edits_path()
+def _radius_suffix(radius_deg: float | None) -> str:
+    radius = _effective_radius(radius_deg)
+    if radius is None:
+        return ''
+    radius_str = f"{radius:.3f}".rstrip('0').rstrip('.')
+    if not radius_str:
+        radius_str = '0'
+    return f"_r{radius_str}"
+
+
+def _edits_path(radius_deg: float | None = None) -> str:
+    suffix = _radius_suffix(radius_deg)
+    base = os.environ.get('EDIT_LINKS_PATH')
+    if base:
+        base_path = Path(base)
+        if base_path.suffix:
+            if suffix:
+                return str(base_path.with_name(base_path.stem + suffix + base_path.suffix))
+            return str(base_path)
+        # Treat as directory (even if it does not yet exist)
+        return str((base_path / f"links{suffix or ''}.json"))
+    base_dir = Path('edits')
     try:
-        if os.path.exists(path):
-            with open(path, 'r') as f:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    filename = f"links{suffix or ''}.json"
+    return str(base_dir / filename)
+
+
+def _load_edits(radius_deg: float | None = None) -> Dict[str, Any]:
+    primary_path = Path(_edits_path(radius_deg))
+    fallback_path: Path | None = None
+    if radius_deg is not None and not primary_path.exists():
+        fallback_path = Path(_edits_path(None))
+        if fallback_path == primary_path:
+            fallback_path = None
+    try:
+        if primary_path.exists():
+            with open(primary_path, 'r') as f:
+                return json.load(f)
+        if fallback_path and fallback_path.exists():
+            with open(fallback_path, 'r') as f:
                 return json.load(f)
     except Exception:
         pass
@@ -3237,8 +3287,11 @@ def plot_after_merge(combined_df: pd.DataFrame,
             col_keys = list(display_cats)
             add_gmag = ('gaia' in display_cats) and ('Gmag' in combined_df.columns)
             headers = [k.upper() for k in col_keys]
-            raw_rows = []  # list of (cells_list, is_matched)
+            raw_rows = []  # list of (cells_list, is_matched, master_idx)
             g_values = []  # per-row G values (strings) to render at right edge
+            rows_limited = []  # rows actually rendered in the table
+            toggle_order = []
+            row_positions = {}
             # De-duplicate table rows by a stable master key (prefer GAIA id when available)
             seen_keys_tbl: set = set()
             for m, _dist in cand_with_dist:
@@ -3281,7 +3334,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     is_matched = (str(combined_df.iloc[m][id_col]) == str(new_id))
                 except Exception:
                     is_matched = (m in matched_set)
-                raw_rows.append((cells, is_matched))
+                raw_rows.append((cells, is_matched, int(m)))
                 # Right-edge G value
                 if add_gmag and ('gaia_id' in combined_df.columns) and not _is_missing(mrow.get('gaia_id', None)) \
                         and pd.notna(mrow.get('Gmag', np.nan)):
@@ -3296,7 +3349,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
             # Skip printing the table if it is effectively empty (all entries are '—')
             all_empty = True
             try:
-                for cells, _is_matched in raw_rows:
+                for cells, _is_matched, _m_idx in raw_rows:
                     if any(str(c).strip() != '—' for c in cells):
                         all_empty = False
                         break
@@ -3305,7 +3358,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
 
             if headers and not all_empty:
                 # Compute column widths from headers and rows (in characters)
-                table_data = [headers] + [cells for (cells, _) in raw_rows]
+                table_data = [headers] + [cells for (cells, _, _) in raw_rows]
                 col_w = [max(len(str(r[i])) for r in table_data) for i in range(len(headers))]
 
                 # --- Scale table size with panel grid ---
@@ -3321,7 +3374,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 y0 = max(0.85, min(0.95, y0))
 
                 # Checkmark space in first column if any matched rows
-                has_match_row = any(is_m for (_, is_m) in raw_rows)
+                has_match_row = any(is_m for (_, is_m, _) in raw_rows)
                 if has_match_row and len(col_w) > 0:
                     col_w[0] += 2  # reserve space for '✓ '
 
@@ -3356,7 +3409,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             fontweight='bold', color=CAT_COLORS.get('gaia','black'))
 
                 # Draw rows per column, color-coded and bold if matched; add '✓ ' on matched rows
-                for r_idx, (cells, is_matched) in enumerate(rows_limited):
+                for r_idx, (cells, is_matched, master_idx) in enumerate(rows_limited):
                     y = y0 - (r_idx + 1) * line_h
                     for i, cell in enumerate(cells):
                         text_cell = str(cell)
@@ -3376,6 +3429,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                 va='top', ha='right', family='monospace', fontsize=font_size,
                                 fontweight=('bold' if is_matched else 'normal'),
                                 color=CAT_COLORS.get('gaia','black'))
+                    row_positions[int(master_idx)] = r_idx
 
                 # If there are more rows than fit, add a small ellipsis line
                 if len(rows_limited) < len(raw_rows):
@@ -3383,6 +3437,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     trans = offset_copy(ax.transAxes, fig=fig, x=x_offsets[0], y=0, units='points')
                     ax.text(0.05, y, f"… (+{len(raw_rows) - len(rows_limited)} more)", transform=trans,
                             va='top', ha='left', family='monospace', fontsize=font_size, color='gray')
+
+                if row_positions:
+                    toggle_order = [idx for idx, _ in sorted(row_positions.items(), key=lambda kv: kv[1])]
 
 
             # Title with short id for the current catalog + compact diagnostics
@@ -4800,16 +4857,27 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                 lx = x_btn_px
                                 # Slight vertical offset so the toggle aligns with the text baseline
                                 ly = table_y_px + shown * y_step_px + 2.0
+                                btn_label = "±"
                                 lines.append(
                                     f'<a class="btn tgl" style="left:{(lx/disp_w)*100:.3f}%;top:{(ly/disp_h)*100:.3f}%;width:auto;height:auto;transform:scale(0.9);transform-origin:left top;" '
-                                    f'href="{href}" title="Toggle identification for {mlabel}">±</a>'
+                                    f'href="{href}" title="Toggle identification for {mlabel}">{btn_label}</a>'
                                 )
                                 shown += 1
                             # 1) Current master rows first
-                            for mi in m_idxs:
+                            ordered_indices = toggle_order if toggle_order else []
+                            used_match_idxs = set()
+                            for mi in ordered_indices:
                                 _emit_for_index(mi)
+                                used_match_idxs.add(mi)
                                 if shown >= N:
                                     break
+                            if shown < N:
+                                for mi in m_idxs:
+                                    if mi in used_match_idxs:
+                                        continue
+                                    _emit_for_index(mi)
+                                    if shown >= N:
+                                        break
                             # 2) Then other master rows in panel proximity
                             if shown < N:
                                 for mi, _dist in cand_with_dist:
@@ -4963,6 +5031,8 @@ def main() -> None:
         radius_val = float(args.radius_deg)
     except Exception:
         radius_val = 1.00
+    global CURRENT_EDITS_RADIUS
+    CURRENT_EDITS_RADIUS = radius_val
     radius = radius_val * u.deg
 
     print("Querying Gaia DR3 ...")
@@ -5015,7 +5085,7 @@ def main() -> None:
         **catalog_params['gaia']
     }
 
-    edits_all = _load_edits()
+    edits_all = _load_edits(radius_val)
     for df_other, id_col in [
         (tmass,     '2MASS'),
         (wise,      'wise_id'),
@@ -5352,6 +5422,8 @@ def build_data_for_web(refresh: bool = False,
     except Exception:
         _r_val = 1.00
     radius = _r_val * u.deg
+    global CURRENT_EDITS_RADIUS
+    CURRENT_EDITS_RADIUS = _r_val
 
     gaia = query_gaia(center, radius)
     gaia = filter_gaia_quality(gaia)

@@ -20,7 +20,6 @@ from aladin_link_server import run_samp_script  # type: ignore
 SCRIPTS_DIR = (BASE_DIR / "aladin_scripts").resolve()
 HTML_DIR = (SCRIPTS_DIR / "html").resolve()
 EDITS_DIR = (BASE_DIR / "edits").resolve()
-EDITS_PATH = (EDITS_DIR / "links.json").resolve()
 
 
 def _is_safe_path(root: Path, target: Path) -> bool:
@@ -30,6 +29,31 @@ def _is_safe_path(root: Path, target: Path) -> bool:
     except FileNotFoundError:
         target = target.parent.resolve()
     return str(target).startswith(str(root))
+
+
+def _load_edits_for_radius(radius_deg: float | None):
+    import json as _json
+    path = Path(cm._edits_path(radius_deg))
+    fallback = None
+    if radius_deg is not None:
+        fallback_candidate = Path(cm._edits_path(None))
+        if fallback_candidate != path:
+            fallback = fallback_candidate
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    data = {}
+    try:
+        if path.exists():
+            with open(path, 'r') as f:
+                data = _json.load(f)
+        elif fallback and fallback.exists():
+            with open(fallback, 'r') as f:
+                data = _json.load(f)
+    except Exception:
+        data = {}
+    return path, data
 
 
 def create_app() -> Flask:
@@ -114,15 +138,7 @@ def create_app() -> Flask:
         except Exception:
             _r_val = None
         # Load edit links and pass to builder
-        try:
-            import json as _json
-            if EDITS_PATH.exists():
-                with open(EDITS_PATH, 'r') as f:
-                    edits = _json.load(f)
-            else:
-                edits = {}
-        except Exception:
-            edits = {}
+        edits_path, edits = _load_edits_for_radius(_r_val)
 
         combined_df, catalogs = cm.build_data_for_web(refresh=refresh,
                                                       chandra_csv_path=os.environ.get('CHANDRA_CSV_PATH', '/Users/ettoref/ASTRONOMY/DATA/N2264_XMM_alt/N2264_acis12.csv'),
@@ -139,6 +155,8 @@ def create_app() -> Flask:
             'combined': combined_df,
             'baseline': baseline_df,
             'catalogs': catalogs,
+            'radius_deg': _r_val,
+            'edits_path': edits_path,
         }
         return combined_df, catalogs
 
@@ -277,6 +295,7 @@ def create_app() -> Flask:
     # Edit-link API: force/remove/toggle links between current catalog source and a master row
     @app.route('/api/edit_link', methods=['GET', 'POST'])
     def api_edit_link():
+        import json as _json
         cat = (request.values.get('cat') or '').strip()
         other = (request.values.get('id') or '').strip()
         master = (request.values.get('master') or '').strip()
@@ -286,12 +305,14 @@ def create_app() -> Flask:
         if not cat or not other or not master:
             abort(400)
         EDITS_DIR.mkdir(parents=True, exist_ok=True)
+        canonical_remove_row = None
+        canonical_force_row = None
+        radius_hint = None
+        cached = DATA.get(cat)
+        if isinstance(cached, dict):
+            radius_hint = cached.get('radius_deg')
+        edits_path, data = _load_edits_for_radius(radius_hint)
         try:
-            import json as _json
-            try:
-                data = _json.load(open(EDITS_PATH, 'r')) if EDITS_PATH.exists() else {}
-            except Exception:
-                data = {}
             sect = data.get(cat) or {'force': [], 'remove': []}
             data[cat] = sect
             # Canonicalize known id formats from URLs that may collapse '+' into space
@@ -347,15 +368,51 @@ def create_app() -> Flask:
                                         hinted_row = None
                                 except Exception:
                                     hinted_row = None
-                    # Evaluate attachment specifically on the hinted row
-                    attached_here = False
+                    # Evaluate attachment for this master/other pair
+                    attached_row = None
                     if hinted_row is not None and id_col in combined_df.columns:
                         try:
-                            attached_here = (str(combined_df.at[hinted_row, id_col]) == str(other))
+                            same_master = True
+                            if mcol and (mcol in combined_df.columns):
+                                same_master = (str(combined_df.at[hinted_row, mcol]) == str(mval))
+                            if same_master and str(combined_df.at[hinted_row, id_col]) == str(other):
+                                attached_row = hinted_row
                         except Exception:
-                            attached_here = False
-                    # Decide action strictly based on the hinted row
-                    action = 'remove' if attached_here else 'force'
+                            attached_row = None
+                    if attached_row is None and id_col in combined_df.columns:
+                        try:
+                            mask = combined_df[id_col].astype(str) == str(other)
+                            if mcol and (mcol in combined_df.columns):
+                                mask = mask & (combined_df[mcol].astype(str) == str(mval))
+                            idxs = [int(ix) for ix in combined_df.index[mask]]
+                            if idxs:
+                                attached_row = idxs[0]
+                        except Exception:
+                            attached_row = None
+                    if attached_row is not None:
+                        action = 'remove'
+                        canonical_remove_row = str(attached_row)
+                    else:
+                        action = 'force'
+                        force_row = None
+                        if hinted_row is not None:
+                            force_row = hinted_row
+                            if mcol and (mcol in combined_df.columns):
+                                try:
+                                    if str(combined_df.at[hinted_row, mcol]) != str(mval):
+                                        force_row = None
+                                except Exception:
+                                    force_row = None
+                        if force_row is None and mcol and (mcol in combined_df.columns):
+                            try:
+                                m_mask = combined_df[mcol].astype(str) == str(mval)
+                                idxs = [int(ix) for ix in combined_df.index[m_mask]]
+                                if idxs:
+                                    force_row = idxs[0]
+                            except Exception:
+                                force_row = None
+                        if force_row is not None:
+                            canonical_force_row = str(force_row)
                 except Exception:
                     # Fallback to legacy behaviour
                     action = 'force'
@@ -374,21 +431,23 @@ def create_app() -> Flask:
             elif action == 'force':
                 if not _contains(sect.get('force', []), other, master):
                     rec = {'other': other, 'master': master}
-                    if row:
-                        rec['row'] = row
+                    row_hint = row or canonical_force_row or None
+                    if row_hint:
+                        rec['row'] = str(row_hint)
                     sect.setdefault('force', []).append(rec)
                 # Remove any remove entry
                 sect['remove'] = [it for it in sect.get('remove', []) if not (str(it.get('other')) == str(other) and str(it.get('master')) == str(master))]
             elif action == 'remove':
                 if not _contains(sect.get('remove', []), other, master):
                     rec = {'other': other, 'master': master}
-                    if row:
-                        rec['row'] = row
+                    row_hint = row or canonical_remove_row or None
+                    if row_hint:
+                        rec['row'] = str(row_hint)
                     sect.setdefault('remove', []).append(rec)
                 # Remove any force entry
                 sect['force'] = [it for it in sect.get('force', []) if not (str(it.get('other')) == str(other) and str(it.get('master')) == str(master))]
             # Persist
-            with open(EDITS_PATH, 'w') as f:
+            with open(edits_path, 'w') as f:
                 _json.dump(data, f, indent=2)
         except Exception as e:
             return {'ok': False, 'error': str(e)}, 500
