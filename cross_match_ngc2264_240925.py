@@ -1278,8 +1278,8 @@ def fetch_2mass_j_image(center: 'SkyCoord', width_deg: float, height_deg: float)
     falling back to CDS hips2fits if needed. Images are cached on disk.
 
     Set environment variable TMASS_FETCH to control behaviour:
-      - 'auto'     : try SkyView, then fall back to HiPS on failure (default)
-      - 'hips'     : use HiPS directly (skip SkyView)
+      - 'hips'     : use HiPS directly (default)
+      - 'auto'     : try SkyView, then fall back to HiPS on failure
       - 'skyview'  : use SkyView only (no fallback)
       - 'off'      : disable image download entirely (no background)
 
@@ -1291,7 +1291,7 @@ def fetch_2mass_j_image(center: 'SkyCoord', width_deg: float, height_deg: float)
         f"2MASSJ_RA{center.ra.deg:.5f}_DEC{center.dec.deg:.5f}_W{width_deg:.4f}_H{height_deg:.4f}.fits"
     )
     refresh = globals().get("REFRESH", False)
-    mode = os.environ.get("TMASS_FETCH", "auto").lower().strip()
+    mode = os.environ.get("TMASS_FETCH", "hips").lower().strip()
 
     if (not refresh) and os.path.exists(cache_name):
         print(f"[2MASS J] cache hit → {cache_name}")

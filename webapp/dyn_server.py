@@ -7,6 +7,9 @@ from typing import Dict
 
 from flask import Flask, abort, redirect, render_template_string, request, send_from_directory, url_for
 import sys
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -59,6 +62,14 @@ def _load_edits_for_radius(radius_deg: float | None):
 def create_app() -> Flask:
     app = Flask(__name__)
 
+    try:
+        _prefetch_workers = max(1, int(os.environ.get('DYN_PREFETCH_WORKERS', '2')))
+    except Exception:
+        _prefetch_workers = 2
+    PREFETCH_EXEC = ThreadPoolExecutor(max_workers=_prefetch_workers)
+    PREFETCH_LOCK = threading.Lock()
+    PREFETCH_TASKS: set[tuple[str, int]] = set()
+
     # Cache datasets per requested catalog key (e.g., '2MASS', 'wise')
     # Each entry keeps the pre-edit baseline so we can reapply edits quickly.
     DATA: Dict[str, Dict[str, object]] = {}
@@ -106,12 +117,30 @@ def create_app() -> Flask:
         return df, catalogs
 
     def _load_data_for_key(key: str):
-        # Return cached subset if present
+        refresh_flag = (os.environ.get('DYN_REFRESH', '0') in ('1', 'true', 'yes'))
         entry = DATA.get(key)
-        if entry:
-            return entry['combined'], entry['catalogs']
+        _r_env = os.environ.get('DYN_RADIUS_DEG')
+        try:
+            _r_val = float(_r_env) if _r_env is not None else None
+        except Exception:
+            _r_val = None
+        same_radius = False
+        if isinstance(entry, dict):
+            stored_radius = entry.get('radius_deg')
+            try:
+                if stored_radius is None and _r_val is None:
+                    same_radius = True
+                elif (stored_radius is not None) and (_r_val is not None):
+                    same_radius = abs(float(stored_radius) - float(_r_val)) <= 1e-9
+            except Exception:
+                same_radius = False
+            if (not refresh_flag) and same_radius:
+                if 'radius_suffix' not in entry:
+                    entry['radius_suffix'] = cm._radius_suffix(entry.get('radius_deg'))
+                return entry['combined'], entry['catalogs']
+
         # Build from queries/caches to ensure per-catalog ellipses and positions are correct.
-        refresh = (os.environ.get('DYN_REFRESH', '0') in ('1', 'true', 'yes'))
+        refresh = refresh_flag
         # By default, dynamic pages should mirror the PDF for that catalog:
         # include only Gaia + previous catalogs up to and including `key` in the
         # merge order used by main(): [2MASS, wise, chandra, xmm].
@@ -131,12 +160,6 @@ def create_app() -> Flask:
             except ValueError:
                 pos = 0
             include = order[:pos+1]
-        # Optional radius override from environment (degrees)
-        _r_env = os.environ.get('DYN_RADIUS_DEG')
-        try:
-            _r_val = float(_r_env) if _r_env is not None else None
-        except Exception:
-            _r_val = None
         # Load edit links and pass to builder
         edits_path, edits = _load_edits_for_radius(_r_val)
 
@@ -151,20 +174,32 @@ def create_app() -> Flask:
                 baseline_df = combined_df.copy(deep=True)
             except Exception:
                 baseline_df = combined_df
+        radius_suffix = cm._radius_suffix(_r_val)
         DATA[key] = {
             'combined': combined_df,
             'baseline': baseline_df,
             'catalogs': catalogs,
             'radius_deg': _r_val,
             'edits_path': edits_path,
+            'radius_suffix': radius_suffix,
         }
         return combined_df, catalogs
 
-    def _ensure_pages_for(key: str, page_num: int, *, draw_images: bool | None = None) -> None:
+    def _schedule_prefetch(key: str, current_page: int, total_pages: int, draw_images: bool) -> None:
+        # Prefetching is disabled to keep page generation strictly on-demand.
+        return
+
+    def _ensure_pages_for(key: str, page_num: int, *, draw_images: bool | None = None, prefetch: bool = True) -> None:
         # Respect existing PDF_DEBUG_D2 setting; default to '0' (overlay off)
         if 'PDF_DEBUG_D2' not in os.environ:
             os.environ['PDF_DEBUG_D2'] = '0'
         combined_df, catalogs = _load_data_for_key(key)
+        entry = DATA.get(key)
+        radius_suffix = ''
+        if isinstance(entry, dict):
+            radius_suffix = entry.get('radius_suffix') or cm._radius_suffix(entry.get('radius_deg'))
+            entry['radius_suffix'] = radius_suffix
+        page_prefix = f"{key}{radius_suffix or ''}"
         if key not in catalogs:
             abort(404)
         # Normalize key for lookup when built from CSV
@@ -203,24 +238,76 @@ def create_app() -> Flask:
         # Default to draw images unless explicitly disabled or overridden via arg
         if draw_images is None:
             draw_images = not (os.environ.get('DYN_NO_IMAGES', '0') in ('1', 'true', 'yes'))
+        per_page = max(1, ncols * nrows)
+        total_pages = max(1, math.ceil(len(df_other) / per_page))
         # Generate only the requested page for this catalog (writes to aladin_scripts/html)
         # Use env var understood by the plotter to limit generation to a single page
         os.environ['ALADIN_PAGE_ONLY'] = str(int(page_num))
-        cm.plot_after_merge(
-            combined_df,
-            df_other,
-            id_col,
-            catalogs,
-            pdf_path=None,
-            plot_mode='match',
-            ncols=ncols,
-            nrows=nrows,
-            invert_cmap=invert,
-            draw_images=draw_images,
-            aladin_dir=str(SCRIPTS_DIR),
-            samp_enabled=False,
-            samp_addr=os.environ.get('SAMP_ADDR', '127.0.0.1')
-        )
+        prev_suffix_env = os.environ.get('ALADIN_PAGE_SUFFIX')
+        try:
+            if radius_suffix:
+                os.environ['ALADIN_PAGE_SUFFIX'] = radius_suffix
+            else:
+                os.environ.pop('ALADIN_PAGE_SUFFIX', None)
+        except Exception:
+            pass
+        try:
+            if isinstance(entry, dict):
+                entry['last_draw_images'] = bool(draw_images)
+            cm.plot_after_merge(
+                combined_df,
+                df_other,
+                id_col,
+                catalogs,
+                pdf_path=None,
+                plot_mode='match',
+                ncols=ncols,
+                nrows=nrows,
+                invert_cmap=invert,
+                draw_images=draw_images,
+                aladin_dir=str(SCRIPTS_DIR),
+                samp_enabled=False,
+                samp_addr=os.environ.get('SAMP_ADDR', '127.0.0.1')
+            )
+            if prefetch:
+                _schedule_prefetch(key, page_num, total_pages, draw_images)
+            if radius_suffix:
+                try:
+                    import shutil
+                    base_prefix = key
+                    target_prefix = f"{key}{radius_suffix}"
+                    file_pairs = []
+                    base_html = HTML_DIR / f"{base_prefix}_page{page_num}.html"
+                    target_html = HTML_DIR / f"{target_prefix}_page{page_num}.html"
+                    if base_html.exists():
+                        file_pairs.append((base_html, target_html))
+                    for ext in ('jpg', 'png', 'webp'):
+                        base_img = HTML_DIR / f"{base_prefix}_page{page_num}.{ext}"
+                        target_img = HTML_DIR / f"{target_prefix}_page{page_num}.{ext}"
+                        if base_img.exists():
+                            file_pairs.append((base_img, target_img))
+                    base_index = HTML_DIR / f"{base_prefix}_index.json"
+                    target_index = HTML_DIR / f"{target_prefix}_index.json"
+                    if base_index.exists():
+                        file_pairs.append((base_index, target_index))
+                    for src_path, dest_path in file_pairs:
+                        try:
+                            if src_path.resolve() == dest_path.resolve():
+                                continue
+                        except Exception:
+                            pass
+                        dest_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_path, dest_path)
+                except Exception:
+                    pass
+        finally:
+            try:
+                if prev_suffix_env is None:
+                    os.environ.pop('ALADIN_PAGE_SUFFIX', None)
+                else:
+                    os.environ['ALADIN_PAGE_SUFFIX'] = prev_suffix_env
+            except Exception:
+                pass
         # Clean up the limiter so subsequent calls can generate other pages if needed
         try:
             del os.environ['ALADIN_PAGE_ONLY']
@@ -253,7 +340,12 @@ def create_app() -> Flask:
         if debug_arg is not None:
             os.environ['PDF_DEBUG_D2'] = '1' if debug_arg.lower() in ('1', 'true', 'yes', 'on') else '0'
         _ensure_pages_for(key, page, draw_images=want_img or None)
-        fname = f"{key}_page{page}.html"
+        entry = DATA.get(key)
+        radius_suffix = ''
+        if isinstance(entry, dict):
+            radius_suffix = entry.get('radius_suffix') or cm._radius_suffix(entry.get('radius_deg'))
+        page_prefix = f"{key}{radius_suffix or ''}"
+        fname = f"{page_prefix}_page{page}.html"
         fpath = HTML_DIR / fname
         if not fpath.exists():
             abort(404)
@@ -266,23 +358,67 @@ def create_app() -> Flask:
         # If a requested page doesn't exist yet or we want to always refresh pages,
         # generate it on the fly by parsing the pattern <key>_page<N>.html
         import re as _re
-        m = _re.match(r"^([^_/]+)_page(\d+)\.(html|jpg|png|webp)$", subpath)
+        m = _re.match(r"^([^/]+)_page(\d+)\.(html|jpg|png|webp)$", subpath)
+        target_subpath = subpath
+        fpath = (HTML_DIR / target_subpath)
         if m:
-            key = m.group(1)
+            prefix_token = m.group(1)
             page_num = int(m.group(2))
-            # Allow forcing image background via query param
+            extension = m.group(3)
             want_img = request.args.get('img', '').lower() in ('1','true','yes','on')
             debug_arg = request.args.get('debug')
             if debug_arg is not None:
                 os.environ['PDF_DEBUG_D2'] = '1' if debug_arg.lower() in ('1','true','yes','on') else '0'
-            try:
-                _ensure_pages_for(key, page_num, draw_images=want_img or None)
-            except Exception:
-                pass
-        fpath = (HTML_DIR / subpath)
+            refresh_env = os.environ.get('DYN_REFRESH', '0').lower() in ('1','true','yes')
+            refresh_qs = request.args.get('refresh', '').lower() in ('1','true','yes','on')
+
+            base_key = prefix_token
+            if base_key not in DATA and '_r' in prefix_token:
+                base_candidate = prefix_token.split('_r', 1)[0]
+                if base_candidate:
+                    base_key = base_candidate
+            if base_key not in DATA:
+                try:
+                    _load_data_for_key(base_key)
+                except Exception:
+                    pass
+            entry = DATA.get(base_key)
+            radius_suffix = ''
+            if isinstance(entry, dict):
+                radius_suffix = entry.get('radius_suffix') or cm._radius_suffix(entry.get('radius_deg'))
+                entry['radius_suffix'] = radius_suffix
+            expected_prefix = f"{base_key}{radius_suffix or ''}"
+            target_name = f"{expected_prefix}_page{page_num}.{extension}"
+            target_subpath = target_name
+            fpath = HTML_DIR / target_subpath
+
+            # Desired draw mode mirrors the page handler: explicit query overrides env.
+            want_img = request.args.get('img', '').lower() in ('1','true','yes','on')
+            draw_expectation = want_img or None
+            if draw_expectation is None:
+                draw_expectation = not (os.environ.get('DYN_NO_IMAGES', '0').lower() in ('1','true','yes','on'))
+
+            needs_refresh = (not fpath.exists()) or refresh_env or refresh_qs
+            entry = DATA.get(base_key)
+            if isinstance(entry, dict):
+                last_mode = entry.get('last_draw_images')
+                if last_mode is not None and bool(last_mode) != bool(draw_expectation):
+                    needs_refresh = True
+            if needs_refresh:
+                try:
+                    _ensure_pages_for(base_key, page_num, draw_images=want_img or None)
+                except Exception:
+                    pass
+                fpath = HTML_DIR / target_subpath
+
+            if target_subpath != subpath:
+                if _is_safe_path(HTML_DIR, fpath) and fpath.exists():
+                    return redirect(url_for('serve_generated', subpath=target_subpath), code=302)
+                # fall through to final safety check
+
         if not _is_safe_path(HTML_DIR, fpath) or not fpath.exists():
             abort(404)
-        return send_from_directory(HTML_DIR, subpath)
+        return send_from_directory(HTML_DIR, target_subpath)
 
     # Also expose the entire aladin_scripts tree (e.g., .ajs and regions)
     @app.get('/aladin_scripts/<path:subpath>')
@@ -452,11 +588,10 @@ def create_app() -> Flask:
         except Exception as e:
             return {'ok': False, 'error': str(e)}, 500
 
-        # Reapply edits to any cached combined tables so we do not rebuild
-        # every catalog after a manual force/remove action.
+        # Reapply edits and respond
         try:
             for cache_key, entry in list(DATA.items()):
-                base_df = entry.get('baseline')  # type: ignore[assignment]
+                base_df = entry.get('baseline')
                 catalogs_entry = entry.get('catalogs')
                 if base_df is None or catalogs_entry is None:
                     continue
@@ -466,11 +601,29 @@ def create_app() -> Flask:
                     updated = base_df.copy(deep=True)
                     updated.attrs['_baseline_unforced'] = base_df
                 entry['combined'] = updated
-        except Exception:
-            # On failure we simply allow a subsequent request to rebuild.
-            pass
-        # Redirect back to the page
-        return redirect(url_for('page', key=cat, page=page), code=302)
+            # After edits, force a refresh of the page content
+            _ensure_pages_for(cat, page, draw_images=True, prefetch=False)
+            wants_json = False
+            try:
+                best = request.accept_mimetypes.best
+            except Exception:
+                best = None
+            try:
+                wants_json = (
+                    (best == 'application/json') or
+                    (request.headers.get('X-Requested-With') == 'XMLHttpRequest') or
+                    (request.accept_mimetypes.get('application/json', 0) >= request.accept_mimetypes.get('text/html', 0))
+                )
+            except Exception:
+                wants_json = False
+            if wants_json:
+                return {'ok': True}
+            ref_url = request.referrer
+            if ref_url:
+                return redirect(ref_url, code=303)
+            return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}, 500
 
     # Provide a compatibility route for the static index reference used by generated pages
     @app.get('/aladin_index.html')
@@ -528,7 +681,7 @@ if __name__ == '__main__':
                         help='WEBP quality 30–95 (env HTML_WEBP_QUALITY)')
     # Background 2MASS J image resolution controls
     parser.add_argument('--tmass-fetch', choices=['auto','hips','skyview','off'], default=None,
-                        help='Select image provider for 2MASS J backgrounds (env TMASS_FETCH)')
+                        help='Select image provider for 2MASS J backgrounds (env TMASS_FETCH, default hips)')
     parser.add_argument('--tmass-arcsec-per-pix', type=float, default=None,
                         help='2MASS J HiPS pixel scale in arcsec/pixel (env TMASS_ARCSEC_PER_PIX)')
     parser.add_argument('--tmass-max-size', type=int, default=None,
