@@ -339,6 +339,10 @@ def create_app() -> Flask:
         debug_arg = request.args.get('debug')
         if debug_arg is not None:
             os.environ['PDF_DEBUG_D2'] = '1' if debug_arg.lower() in ('1', 'true', 'yes', 'on') else '0'
+            os.environ['ALADIN_SHOW_DEBUG'] = os.environ['PDF_DEBUG_D2']
+        else:
+            os.environ['PDF_DEBUG_D2'] = '0'
+            os.environ['ALADIN_SHOW_DEBUG'] = '0'
         _ensure_pages_for(key, page, draw_images=want_img or None)
         entry = DATA.get(key)
         radius_suffix = ''
@@ -369,6 +373,10 @@ def create_app() -> Flask:
             debug_arg = request.args.get('debug')
             if debug_arg is not None:
                 os.environ['PDF_DEBUG_D2'] = '1' if debug_arg.lower() in ('1','true','yes','on') else '0'
+                os.environ['ALADIN_SHOW_DEBUG'] = os.environ['PDF_DEBUG_D2']
+            else:
+                os.environ['PDF_DEBUG_D2'] = '0'
+                os.environ['ALADIN_SHOW_DEBUG'] = '0'
             refresh_env = os.environ.get('DYN_REFRESH', '0').lower() in ('1','true','yes')
             refresh_qs = request.args.get('refresh', '').lower() in ('1','true','yes','on')
 
@@ -394,6 +402,10 @@ def create_app() -> Flask:
 
             # Desired draw mode mirrors the page handler: explicit query overrides env.
             want_img = request.args.get('img', '').lower() in ('1','true','yes','on')
+            debug_arg = request.args.get('debug')
+            if debug_arg is not None:
+                os.environ['PDF_DEBUG_D2'] = '1' if debug_arg.lower() in ('1','true','yes','on') else '0'
+                os.environ['ALADIN_SHOW_DEBUG'] = os.environ['PDF_DEBUG_D2']
             draw_expectation = want_img or None
             if draw_expectation is None:
                 draw_expectation = not (os.environ.get('DYN_NO_IMAGES', '0').lower() in ('1','true','yes','on'))
@@ -680,7 +692,7 @@ if __name__ == '__main__':
     parser.add_argument('--html-webp-quality', type=int, default=None,
                         help='WEBP quality 30–95 (env HTML_WEBP_QUALITY)')
     # Background 2MASS J image resolution controls
-    parser.add_argument('--tmass-fetch', choices=['auto','hips','skyview','off'], default=None,
+    parser.add_argument('--tmass-fetch', choices=['auto','hips','skyview','off'], default='hips',
                         help='Select image provider for 2MASS J backgrounds (env TMASS_FETCH, default hips)')
     parser.add_argument('--tmass-arcsec-per-pix', type=float, default=None,
                         help='2MASS J HiPS pixel scale in arcsec/pixel (env TMASS_ARCSEC_PER_PIX)')

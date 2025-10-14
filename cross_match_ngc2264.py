@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import sys
 from typing import List, Optional
+from collections import defaultdict
+from contextlib import contextmanager, nullcontext
+from time import perf_counter
 import numpy as np
 import numpy.linalg as la
 
@@ -119,6 +122,72 @@ def _effective_radius(radius_deg: float | None = None) -> float | None:
             continue
     return None
 
+
+class _PlotProfiler:
+    """Lightweight optional profiler for plot_after_merge."""
+
+    def __init__(self, enabled: bool, prefix: str = "plot_after_merge"):
+        self.enabled = bool(enabled)
+        if not self.enabled:
+            return
+        self.prefix = prefix
+        self._totals: dict[str, float] = defaultdict(float)
+        self._counts: dict[str, int] = defaultdict(int)
+        self._stack: list[tuple[str, float]] = []
+
+    def tic(self, name: str) -> None:
+        if not self.enabled:
+            return
+        self._stack.append((name, perf_counter()))
+
+    def toc(self, name: str) -> float:
+        if not self.enabled:
+            return 0.0
+        for idx in range(len(self._stack) - 1, -1, -1):
+            tag, start = self._stack[idx]
+            if tag == name:
+                self._stack.pop(idx)
+                dt = perf_counter() - start
+                self._totals[name] += dt
+                self._counts[name] += 1
+                return dt
+        return 0.0
+
+    @contextmanager
+    def section(self, name: str):
+        self.tic(name)
+        try:
+            yield
+        finally:
+            self.toc(name)
+
+    def add(self, name: str, duration: float, *, count: int = 1) -> None:
+        if not self.enabled:
+            return
+        self._totals[name] += float(duration)
+        self._counts[name] += int(count)
+
+    def emit(self, label: str = "") -> None:
+        if not self.enabled:
+            return
+        header = f"[profile] {self.prefix}" if not label else f"[profile] {self.prefix} {label}"
+        print(header)
+        for key, total in sorted(self._totals.items(), key=lambda kv: kv[1], reverse=True):
+            calls = self._counts.get(key, 0)
+            avg = (total / calls) if calls else total
+            print(f"[profile]  {key:24s} total={total*1000:.1f} ms  calls={calls:3d}  avg={avg*1000:.1f} ms")
+
+
+@contextmanager
+def _diag_timer(profiler: _PlotProfiler, log: list[tuple[str, float]] | None, label: str):
+    start = perf_counter()
+    try:
+        yield
+    finally:
+        duration = perf_counter() - start
+        profiler.add(f'diag_{label}', duration)
+        if log is not None:
+            log.append((label, duration))
 
 def _radius_suffix(radius_deg: float | None) -> str:
     radius = _effective_radius(radius_deg)
@@ -1542,7 +1611,8 @@ def cross_match(source_df: pd.DataFrame,
             if D2 <= 1.0:
                 if other_id_col in other_df.columns:
                     ids.append(other_df.iloc[j][other_id_col])
-                # Fallback: compute D² to the nearest valid master within this branch
+                else:
+                    # Fall back to using the DataFrame index when no identifier column exists
                     ids.append(other_df.index[j])
         matches.append(ids)
 
@@ -2014,7 +2084,11 @@ def plot_after_merge(combined_df: pd.DataFrame,
         PDF_DEBUG_D2 = str(os.environ.get('PDF_DEBUG_D2', '0')).strip().lower() in ('1', 'true', 'yes', 'on')
     except Exception:
         PDF_DEBUG_D2 = False
+    debug_env = str(os.environ.get('ALADIN_SHOW_DEBUG', '1' if PDF_DEBUG_D2 else '0')).strip().lower() in ('1', 'true', 'yes', 'on')
     cur_color = CAT_COLORS.get(key, '#17becf')  # color for the current (new) catalog
+
+    profile_enabled = str(os.environ.get('ALADIN_PROFILE', '0')).strip().lower() in ('1', 'true', 'yes', 'on')
+    profiler = _PlotProfiler(profile_enabled, prefix=f"plot_after_merge[{key}]")
 
     # Avoid pyplot figure warning for many pages
     try:
@@ -2243,6 +2317,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 or (isinstance(val, (int, np.integer, float))
                     and ((isinstance(val, float) and np.isnan(val)) or val == -1)))
 
+    profiler.tic('precompute')
     pdf = PdfPages(pdf_path) if pdf_path else None
     per_page = ncols * nrows
     total = len(other_df)
@@ -2256,6 +2331,85 @@ def plot_after_merge(combined_df: pd.DataFrame,
     else:
         oth_maj_plot = other_df['errMaj'].values
         oth_min_plot = other_df['errMin'].values
+    profiler.toc('precompute')
+
+    # Precompute tangent-plane coordinates for efficient per-panel subsets.
+    if len(combined_df):
+        ra_ref = float(np.nanmedian(combined_df['ra_deg']))
+        dec_ref = float(np.nanmedian(combined_df['dec_deg']))
+    elif len(other_df):
+        ra_ref = float(np.nanmedian(other_df['ra_deg']))
+        dec_ref = float(np.nanmedian(other_df['dec_deg']))
+    else:
+        ra_ref = 0.0
+        dec_ref = 0.0
+    cos_ref = np.cos(np.deg2rad(dec_ref))
+
+    combined_ra_arr = combined_df['ra_deg'].to_numpy(dtype=float, copy=False)
+    combined_dec_arr = combined_df['dec_deg'].to_numpy(dtype=float, copy=False)
+    combined_x = (combined_ra_arr - ra_ref) * cos_ref * 3600.0
+    combined_y = (combined_dec_arr - dec_ref) * 3600.0
+
+    other_ra_arr = other_df['ra_deg'].to_numpy(dtype=float, copy=False)
+    other_dec_arr = other_df['dec_deg'].to_numpy(dtype=float, copy=False)
+    other_x = (other_ra_arr - ra_ref) * cos_ref * 3600.0
+    other_y = (other_dec_arr - dec_ref) * 3600.0
+
+    try:
+        cell_arcsec = float(os.environ.get('ALADIN_PANEL_GRID_ARCSEC', '20'))
+    except Exception:
+        cell_arcsec = 20.0
+    if not np.isfinite(cell_arcsec) or cell_arcsec <= 0.0:
+        cell_arcsec = 20.0
+    inv_cell = 1.0 / cell_arcsec
+
+    def _build_grid(x_arr: np.ndarray, y_arr: np.ndarray) -> dict[tuple[int, int], np.ndarray]:
+        grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+        if x_arr.size == 0:
+            return {}
+        cell_x = np.floor(x_arr * inv_cell).astype(np.int64, copy=False)
+        cell_y = np.floor(y_arr * inv_cell).astype(np.int64, copy=False)
+        for idx, (cx, cy) in enumerate(zip(cell_x, cell_y)):
+            grid[(int(cx), int(cy))].append(idx)
+        return {key: np.asarray(values, dtype=np.int64) for key, values in grid.items()}
+
+    def _collect_indices(grid: dict[tuple[int, int], np.ndarray],
+                         center_x: float,
+                         center_y: float,
+                         radius_arcsec: float) -> np.ndarray:
+        if not grid or radius_arcsec <= 0.0:
+            return np.empty(0, dtype=np.int64)
+        cell_radius = int(np.ceil(radius_arcsec / cell_arcsec)) + 1
+        base_cx = int(np.floor(center_x * inv_cell))
+        base_cy = int(np.floor(center_y * inv_cell))
+        buckets: list[np.ndarray] = []
+        for dx_cell in range(-cell_radius, cell_radius + 1):
+            cx = base_cx + dx_cell
+            for dy_cell in range(-cell_radius, cell_radius + 1):
+                arr = grid.get((cx, base_cy + dy_cell))
+                if arr is not None and arr.size:
+                    buckets.append(arr)
+        if not buckets:
+            return np.empty(0, dtype=np.int64)
+        return np.unique(np.concatenate(buckets))
+
+    combined_grid = _build_grid(combined_x, combined_y)
+    other_grid = _build_grid(other_x, other_y)
+
+    if 'gaia_id' in combined_df.columns:
+        valid_master_mask_global = (~combined_df['gaia_id'].isna()) & (combined_df['gaia_id'] != -1)
+    else:
+        valid_master_mask_global = np.ones(len(combined_df), dtype=bool)
+    if id_col in combined_df.columns:
+        id_series_global = combined_df[id_col]
+    elif len(combined_df.columns):
+        id_series_global = combined_df.iloc[:, 0]
+    else:
+        id_series_global = pd.Series([None] * len(combined_df))
+    try:
+        id_series_global_str = id_series_global.astype(str).to_numpy(copy=False)
+    except Exception:
+        id_series_global_str = np.asarray([str(v) for v in id_series_global])
 
     # Allow restricting generation to a single page via env: ALADIN_PAGE_ONLY
     try:
@@ -2263,6 +2417,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
     except Exception:
         _page_only = 0
     for start in range(0, total, per_page):
+        profiler.tic('page_total')
         page_num = (start // per_page) + 1
         if _page_only > 0 and page_num != _page_only:
             continue
@@ -2281,56 +2436,104 @@ def plot_after_merge(combined_df: pd.DataFrame,
             dec0 = other_df.iloc[j]['dec_deg']
             epoch_row = _epoch_from_row(other_df.iloc[j])
 
-            # Offsets for background
-            dx_oth = (other_df['ra_deg'] - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
-            dy_oth = (other_df['dec_deg'] - dec0) * 3600.0
-            dx_src = (combined_df['ra_deg'] - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
-            dy_src = (combined_df['dec_deg'] - dec0) * 3600.0
-            # Global nearest Gaia master by angular separation (arcsec), excluding the synthetic self row
-            if 'gaia_id' in combined_df.columns:
-                valid_master_mask = (~combined_df['gaia_id'].isna()) & (combined_df['gaia_id'] != -1)
-            else:
-                valid_master_mask = np.ones(len(combined_df), dtype=bool)
-            try:
-                not_self_mask = combined_df[id_col].astype(str) != str(new_id)
-            except Exception:
-                not_self_mask = np.ones(len(combined_df), dtype=bool)
-            nearest_mask = valid_master_mask & not_self_mask
+            profiler.tic('panel_offsets')
+            center_x = (ra0 - ra_ref) * cos_ref * 3600.0
+            center_y = (dec0 - dec_ref) * 3600.0
+
+            margin = max(oth_maj_plot[j], oth_min_plot[j]) * 2.0
+            margin = max(margin, 5.0)  # at least ±2.5" half-width
+            search_radius_src = margin + cell_arcsec
+            search_radius_oth = margin + cell_arcsec
+
+            oth_idx_arr = _collect_indices(other_grid, center_x, center_y, search_radius_oth)
+            src_idx_arr = _collect_indices(combined_grid, center_x, center_y, search_radius_src)
+
+            def _build_offset_dict(idx_array: np.ndarray,
+                                   x_arr: np.ndarray,
+                                   y_arr: np.ndarray) -> dict[int, tuple[float, float]]:
+                offsets: dict[int, tuple[float, float]] = {}
+                if idx_array.size:
+                    dx_vals = x_arr[idx_array] - center_x
+                    dy_vals = y_arr[idx_array] - center_y
+                    for idx_val, dx_val, dy_val in zip(idx_array, dx_vals, dy_vals):
+                        offsets[int(idx_val)] = (float(dx_val), float(dy_val))
+                return offsets
+
+            oth_offsets = _build_offset_dict(oth_idx_arr, other_x, other_y)
+            if j not in oth_offsets:
+                oth_offsets[int(j)] = (float(other_x[j] - center_x), float(other_y[j] - center_y))
+            src_offsets = _build_offset_dict(src_idx_arr, combined_x, combined_y)
+
+            def _oth_offset(idx: int) -> tuple[float, float]:
+                idx = int(idx)
+                val = oth_offsets.get(idx)
+                if val is None:
+                    val = (float(other_x[idx] - center_x), float(other_y[idx] - center_y))
+                    oth_offsets[idx] = val
+                return val
+
+            def _src_offset(idx: int) -> tuple[float, float]:
+                idx = int(idx)
+                val = src_offsets.get(idx)
+                if val is None:
+                    val = (float(combined_x[idx] - center_x), float(combined_y[idx] - center_y))
+                    src_offsets[idx] = val
+                return val
+
+            def _src_dx(idx: int) -> float:
+                return _src_offset(idx)[0]
+
+            def _src_dy(idx: int) -> float:
+                return _src_offset(idx)[1]
+
+            oth_indices = list(oth_offsets.keys())
+            new_id_str = str(new_id)
+
+            candidate_indices_raw = list(src_offsets.keys())
             _nearest_idx = None
             nearest_sep_arcsec = None
-            if np.any(nearest_mask):
-                # Prefer distances computed from original Gaia coordinates to avoid artifacts from
-                # post-merge coordinate updates (which can make sep appear as 0.0)
-                try:
-                    gaia_df = all_catalogs.get('gaia', {}).get('data') if isinstance(all_catalogs, dict) else None
-                except Exception:
-                    gaia_df = None
-                idxs = np.where(nearest_mask)[0]
-                best_d = None
-                for ii in idxs:
-                    if (gaia_df is not None) and ('gaia_id' in combined_df.columns):
-                        gid = combined_df.iloc[ii].get('gaia_id', None)
-                        if (gid is not None) and (gid in gaia_df.index):
-                            grow = gaia_df.loc[gid]
-                            dxm = (float(grow['ra_deg']) - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
-                            dym = (float(grow['dec_deg']) - dec0) * 3600.0
-                            d = float(np.hypot(dxm, dym))
+            if candidate_indices_raw:
+                cand_arr = np.asarray(candidate_indices_raw, dtype=int)
+                mask_valid = valid_master_mask_global[cand_arr]
+                mask_not_self = (id_series_global_str[cand_arr] != new_id_str)
+                nearby_candidates = cand_arr[mask_valid & mask_not_self]
+                if nearby_candidates.size:
+                    try:
+                        gaia_df = all_catalogs.get('gaia', {}).get('data') if isinstance(all_catalogs, dict) else None
+                    except Exception:
+                        gaia_df = None
+                    best = None
+                    for ii in nearby_candidates:
+                        if (gaia_df is not None) and ('gaia_id' in combined_df.columns):
+                            gid = combined_df.iloc[ii].get('gaia_id', None)
+                            if (gid is not None) and (gid in gaia_df.index):
+                                grow = gaia_df.loc[gid]
+                                dxm = (float(grow['ra_deg']) - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
+                                dym = (float(grow['dec_deg']) - dec0) * 3600.0
+                                dist = float(np.hypot(dxm, dym))
+                            else:
+                                dxm, dym = _src_offset(ii)
+                                dist = float(np.hypot(dxm, dym))
                         else:
-                            d = float(np.hypot(dx_src.iloc[ii], dy_src.iloc[ii]))
-                    else:
-                        d = float(np.hypot(dx_src.iloc[ii], dy_src.iloc[ii]))
-                    if (best_d is None) or (d < best_d[1]):
-                        best_d = (ii, d)
-                if best_d is not None:
-                    _nearest_idx, nearest_sep_arcsec = int(best_d[0]), float(best_d[1])
+                            dxm, dym = _src_offset(ii)
+                            dist = float(np.hypot(dxm, dym))
+                        if (best is None) or (dist < best[1]):
+                            best = (ii, dist)
+                    if best is not None:
+                        _nearest_idx = int(best[0])
+                        nearest_sep_arcsec = float(best[1])
+
+            cand_set = set(candidate_indices_raw)
+            if _nearest_idx is not None:
+                cand_set.add(int(_nearest_idx))
+            cand_indices = [idx for idx in cand_set
+                            if abs(_src_dx(idx)) <= margin and abs(_src_dy(idx)) <= margin]
+            profiler.toc('panel_offsets')
             # PM-corrected closest separation (computed later when we know Δt); used for title display
             closest_sep_pm_arcsec = None
 
-            # Determine plotting margin in arcsec
-            margin = max(oth_maj_plot[j], oth_min_plot[j]) * 2.0
-            margin = max(margin, 5.0)  # at least ±2.5" half-width
-
             # If this is a 2MASS panel and allowed, draw a 2MASS J-band background aligned via WCS
+            profiler.tic('panel_tmass_fetch')
             if draw_images and key == '2MASS':
                 center_icrs = SkyCoord(ra=ra0 * u.deg, dec=dec0 * u.deg, frame='icrs')
                 fov_deg = (2.0 * margin) / 3600.0  # full width/height in degrees
@@ -2390,20 +2593,21 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         interpolation='nearest',
                         norm=norm
                     )
+            profiler.toc('panel_tmass_fetch')
 
+            profiler.toc('panel_offsets')
+            profiler.tic('panel_overlay')
             # Plot new-catalog background (light blue)
-            for k in range(len(other_df)):
-                if abs(dx_oth.iloc[k]) <= margin and abs(dy_oth.iloc[k]) <= margin:
-                    e = Ellipse((dx_oth.iloc[k], dy_oth.iloc[k]),
+            for k in oth_indices:
+                dx_k, dy_k = _oth_offset(k)
+                if abs(dx_k) <= margin and abs(dy_k) <= margin:
+                    e = Ellipse((dx_k, dy_k),
                                 width=2*oth_maj_plot[k],
                                 height=2*oth_min_plot[k],
                                 angle=(90.0 - float(other_df.iloc[k]['errPA'])),
                                 edgecolor='lightblue', linestyle='-', fill=False)
                     ax.add_patch(e)
 
-            # Collect candidate master rows within the plotted area; per-catalog plotting happens below
-            cand_indices = [int(m) for m in range(len(combined_df))
-                            if abs(dx_src.iloc[m]) <= margin and abs(dy_src.iloc[m]) <= margin]
             # Do not hide the synthetic self-row anymore in master-centric mode.
             # Previously we suppressed rows with (same id and gaia_id == -1). That prevented
             # legitimate matches in catalogs without Gaia counterpart from appearing.
@@ -2439,6 +2643,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
             drawn_components = set()  # avoid drawing the same component twice in a panel
             if master_indices:
                 for master_idx in master_indices:
+                    if master_idx not in cand_set:
+                        _src_offset(master_idx)
+                        cand_set.add(master_idx)
+                        cand_indices.append(master_idx)
                     mrow = combined_df.iloc[master_idx]
                     # Skip synthetic self-row for the current catalog (unmatched "self")
                     try:
@@ -2455,8 +2663,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         continue
                     # Draw the master position (diamond) only if it has at least one preceding-catalog id
                     try:
-                        mx = float(dx_src.iloc[master_idx])
-                        my = float(dy_src.iloc[master_idx])
+                        mx, my = _src_offset(master_idx)
                         def _has_prev(mr, cur_key: str) -> bool:
                             order = ['gaia', '2MASS', 'wise', 'chandra', 'xmm']
                             try:
@@ -2601,8 +2808,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                     has_prev = True
                                     break
                             if has_prev:
+                                mx_u, my_u = _src_offset(m)
                                 ax.plot(
-                                    dx_src.iloc[m], dy_src.iloc[m],
+                                    mx_u, my_u,
                                     marker='D', linestyle='None',
                                     markersize=5, markeredgewidth=1.0,
                                     markerfacecolor='none', color='#c0c0c0', alpha=0.9
@@ -2653,6 +2861,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     except Exception:
                         pass
 
+            profiler.toc('panel_overlay')
+            profiler.tic('panel_diagnostics')
             # --- Compute compact diagnostics (best separation and Mahalanobis D²) for title ---
             def _cov_from_axes(maj_as, min_as, pa_deg):
                 # Clamp semi-axes to a small positive value and build covariance in arcsec^2
@@ -2758,8 +2968,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                 pm_dy = _pmde2 * 0.001 * dt_tmp2
                         except Exception:
                             pm_dx = pm_dy = 0.0
-                    vec_loc = np.array([float(dx_src.iloc[int(m_idx)]) + pm_dx,
-                                        float(dy_src.iloc[int(m_idx)]) + pm_dy])
+                    dx_loc, dy_loc = _src_offset(int(m_idx))
+                    vec_loc = np.array([dx_loc + pm_dx, dy_loc + pm_dy])
                     d2_loc = float(vec_loc.dot(invC_loc).dot(vec_loc))
                     sep_loc = float(np.hypot(*vec_loc))
                     try:
@@ -2808,7 +3018,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
             used_master_idx = None
             nearest_d2 = None
             nearest_dt = None
-            debug_info_lines = [] if PDF_DEBUG_D2 else None
+            debug_info_lines = [] if debug_env else None
+            diag_log: list[tuple[str, float]] | None = [] if debug_env else None
+            diag_total_start = perf_counter()
+
             if master_indices:
                 # Consider only real master rows (exclude synthetic self-rows with gaia_id == -1)
                 try:
@@ -2819,98 +3032,97 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 except Exception:
                     master_valid = []
                 if master_valid:
-                    _maj_use, _min_use, _pa_use, _raw_maj_use, _raw_min_use = _scaled_ellipse_by_id(key, other_df.iloc[j][id_col], id_col)
-                    Cnew = _cov_from_axes(_maj_use, _min_use, _pa_use)
-                    # Use a realistic floor for master semi-axes in arcsec when forming Cmas
-                    master_floor_as = 0.05
-                    # Deterministic choice for the D² baseline: pick the master row with the
-                    # smallest ellipse area (after flooring), so we always use the most precise
-                    # component of the master.
-                    def _area_at(idx):
+                    with _diag_timer(profiler, diag_log, 'matched_branch'):
+                        _maj_use, _min_use, _pa_use, _raw_maj_use, _raw_min_use = _scaled_ellipse_by_id(key, other_df.iloc[j][id_col], id_col)
+                        Cnew = _cov_from_axes(_maj_use, _min_use, _pa_use)
+                        master_floor_as = 0.05
+
+                        def _area_at(idx):
+                            try:
+                                a = float(combined_df.iloc[idx]['errMaj'])
+                                b = float(combined_df.iloc[idx]['errMin'])
+                            except Exception:
+                                a = np.nan; b = np.nan
+                            if not np.isfinite(a):
+                                a = master_floor_as
+                            if not np.isfinite(b):
+                                b = master_floor_as
+                            a = max(a, master_floor_as)
+                            b = max(b, master_floor_as)
+                            return a * b
+
                         try:
-                            a = float(combined_df.iloc[idx]['errMaj'])
-                            b = float(combined_df.iloc[idx]['errMin'])
+                            used_master_idx = min(master_valid, key=_area_at)
                         except Exception:
-                            a = np.nan; b = np.nan
-                        if not np.isfinite(a): a = master_floor_as
-                        if not np.isfinite(b): b = master_floor_as
-                        a = max(a, master_floor_as); b = max(b, master_floor_as)
-                        return a * b
-                    try:
-                        used_master_idx = min(master_valid, key=_area_at)
-                    except Exception:
-                        used_master_idx = master_valid[0]
-                    # Compute D² against the chosen row only (deterministic)
-                    m = used_master_idx
-                    # PM-corrected residual vector Gaia→catalog row (arcsec)
-                    pm_dx = 0.0; pm_dy = 0.0
-                    if (epoch_row is not None) and ('pmra' in combined_df.columns) and ('pmdec' in combined_df.columns) and ('ref_epoch' in combined_df.columns):
-                        try:
-                            ref_ep = float(combined_df.iloc[m]['ref_epoch'])
-                            if np.isfinite(ref_ep):
-                                dt_tmp = float(epoch_row - ref_ep)
-                                _pmra = float(combined_df.iloc[m]['pmra'])
-                                _pmde = float(combined_df.iloc[m]['pmdec'])
-                                if not np.isfinite(_pmra):
-                                    _pmra = 0.0
-                                if not np.isfinite(_pmde):
-                                    _pmde = 0.0
-                                pm_dx = _pmra * 0.001 * dt_tmp
-                                pm_dy = _pmde * 0.001 * dt_tmp
-                        except Exception:
-                            pm_dx = 0.0; pm_dy = 0.0
-                        vec = np.array([float(dx_src.iloc[m]) + pm_dx, float(dy_src.iloc[m]) + pm_dy])
+                            used_master_idx = master_valid[0]
+                        m = used_master_idx
+                        pm_dx = 0.0
+                        pm_dy = 0.0
+                        if (epoch_row is not None) and ('pmra' in combined_df.columns) and ('pmdec' in combined_df.columns) and ('ref_epoch' in combined_df.columns):
+                            try:
+                                ref_ep = float(combined_df.iloc[m]['ref_epoch'])
+                                if np.isfinite(ref_ep):
+                                    dt_tmp = float(epoch_row - ref_ep)
+                                    _pmra = float(combined_df.iloc[m]['pmra'])
+                                    _pmde = float(combined_df.iloc[m]['pmdec'])
+                                    if not np.isfinite(_pmra):
+                                        _pmra = 0.0
+                                    if not np.isfinite(_pmde):
+                                        _pmde = 0.0
+                                    pm_dx = _pmra * 0.001 * dt_tmp
+                                    pm_dy = _pmde * 0.001 * dt_tmp
+                            except Exception:
+                                pm_dx = 0.0
+                                pm_dy = 0.0
+                        dx_m, dy_m = _src_offset(m)
+                        vec = np.array([dx_m + pm_dx, dy_m + pm_dy])
                         mrow = combined_df.iloc[m]
                         try:
                             maj_m = float(mrow['errMaj'])
                             min_m = float(mrow['errMin'])
-                            pa_m  = float(mrow['errPA'])
+                            pa_m = float(mrow['errPA'])
                         except Exception:
-                            maj_m = master_floor_as; min_m = master_floor_as; pa_m = 0.0
-                        # Floor master ellipse to avoid near-singular covariances
-                        if not np.isfinite(maj_m): maj_m = master_floor_as
-                        if not np.isfinite(min_m): min_m = master_floor_as
+                            maj_m = master_floor_as
+                            min_m = master_floor_as
+                            pa_m = 0.0
+                        if not np.isfinite(maj_m):
+                            maj_m = master_floor_as
+                        if not np.isfinite(min_m):
+                            min_m = master_floor_as
                         maj_m = max(maj_m, master_floor_as)
                         min_m = max(min_m, master_floor_as)
                         Cmas = _cov_from_axes(maj_m, min_m, pa_m)
                         try:
-                            if (not np.all(np.isfinite(Cmas))) or (Cmas[0,0] < 1e-6) or (Cmas[1,1] < 1e-6):
+                            if (not np.all(np.isfinite(Cmas))) or (Cmas[0, 0] < 1e-6) or (Cmas[1, 1] < 1e-6):
                                 phi = np.deg2rad(float(pa_m)) if np.isfinite(pa_m) else 0.0
                                 sphi, cphi = np.sin(phi), np.cos(phi)
                                 a2 = float(maj_m) * float(maj_m)
                                 b2 = float(min_m) * float(min_m)
-                                C11 = a2 * sphi*sphi + b2 * cphi*cphi
-                                C22 = a2 * cphi*cphi + b2 * sphi*sphi
+                                C11 = a2 * sphi * sphi + b2 * cphi * cphi
+                                C22 = a2 * cphi * cphi + b2 * sphi * sphi
                                 C12 = (a2 - b2) * sphi * cphi
                                 Cmas = np.array([[C11, C12], [C12, C22]], dtype=float) + np.eye(2) * 1e-9
                         except Exception:
                             pass
-                        # PM-uncertainty inflation for this candidate baseline
-                        # Only apply if all inputs are finite for this row
                         if (epoch_row is not None) and ('ref_epoch' in combined_df.columns):
-                            dt_tmp_local = None
                             try:
                                 ref_ep_local = float(mrow['ref_epoch'])
-                                if np.isfinite(ref_ep_local):
+                                if np.isfinite(ref_ep_local) and ('pmra_error' in combined_df.columns) and ('pmdec_error' in combined_df.columns):
                                     dt_tmp_local = float(epoch_row - ref_ep_local)
-                            except Exception:
-                                dt_tmp_local = None
-                            if (dt_tmp_local is not None) and ('pmra_error' in combined_df.columns) and ('pmdec_error' in combined_df.columns):
-                                try:
                                     sra = float(mrow['pmra_error'])
                                     sde = float(mrow['pmdec_error'])
                                     if np.isfinite(sra) and np.isfinite(sde):
                                         sig_ra = abs(sra) * 0.001 * abs(dt_tmp_local)
                                         sig_de = abs(sde) * 0.001 * abs(dt_tmp_local)
                                         Cmas = Cmas + np.diag([sig_ra**2, sig_de**2])
-                                except Exception:
-                                    pass
+                            except Exception:
+                                pass
                         Csum = Cnew + Cmas
-                        # Robust inverse with jitter and pseudo-inverse fallback
                         invC = _safe_inv(Csum)
                         if invC is None:
-                            best_d2 = None; best_sep = None
-                            if PDF_DEBUG_D2 and debug_info_lines is not None:
+                            best_d2 = None
+                            best_sep = None
+                            if debug_env and debug_info_lines is not None:
                                 debug_info_lines.append("D2: invC None (singular)")
                         else:
                             d2 = float(vec.dot(invC).dot(vec))
@@ -2923,8 +3135,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                     best_dt = None
                             best_master_maj = maj_m
                             best_master_min = min_m
-                            best_master_pa  = pa_m
-                            if PDF_DEBUG_D2 and debug_info_lines is not None:
+                            best_master_pa = pa_m
+                            if debug_env and debug_info_lines is not None:
                                 try:
                                     evals, _ = np.linalg.eigh(Csum)
                                     evals = [float(x) for x in evals]
@@ -2950,7 +3162,6 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 else:
                     # No valid master rows despite a synthetic self-row: compute nearest D² like the unmatched branch
                     try:
-                        # Determine nearest index using Gaia positions when possible
                         if 'gaia_id' in combined_df.columns:
                             valid_master_mask = (~combined_df['gaia_id'].isna()) & (combined_df['gaia_id'] != -1)
                         else:
@@ -2965,86 +3176,85 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                 gaia_df2 = all_catalogs.get('gaia', {}).get('data') if isinstance(all_catalogs, dict) else None
                             except Exception:
                                 gaia_df2 = None
-                            idxs = np.where(nearest_mask)[0]
-                            best = None
-                            for ii in idxs:
-                                if (gaia_df2 is not None) and ('gaia_id' in combined_df.columns):
-                                    gid = combined_df.iloc[ii].get('gaia_id', None)
-                                    if (gid is not None) and (gid in gaia_df2.index):
-                                        grow = gaia_df2.loc[gid]
-                                        dxm = (float(grow['ra_deg']) - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
-                                        dym = (float(grow['dec_deg']) - dec0) * 3600.0
-                                        d = float(np.hypot(dxm, dym))
-                                    else:
-                                        d = float(np.hypot(dx_src.iloc[ii], dy_src.iloc[ii]))
-                                else:
-                                    d = float(np.hypot(dx_src.iloc[ii], dy_src.iloc[ii]))
-                                if (best is None) or (d < best[1]):
-                                    best = (ii, d)
-                            if best is not None:
-                                _nearest_idx = int(best[0])
-                        # Force D² computation via the common nearest fallback (below in title block)
+                            try:
+                                nearest_mask_arr = nearest_mask.to_numpy(dtype=bool, copy=False)  # type: ignore[attr-defined]
+                            except Exception:
+                                nearest_mask_arr = np.asarray(nearest_mask, dtype=bool)
+                            idxs = np.nonzero(nearest_mask_arr)[0]
+                            if idxs.size:
+                                dx_vals = combined_x[idxs] - center_x
+                                dy_vals = combined_y[idxs] - center_y
+                                dist2_vals = dx_vals * dx_vals + dy_vals * dy_vals
+                                best_pos = int(np.argmin(dist2_vals))
+                                best_idx = int(idxs[best_pos])
+                                _nearest_idx = best_idx
+                                nearest_sep_arcsec = float(np.sqrt(dist2_vals[best_pos]))
+                                # Cache the offset for downstream consumers that expect it to exist.
+                                src_offsets.setdefault(best_idx, (float(dx_vals[best_pos]), float(dy_vals[best_pos])))
                     except Exception:
                         pass
-                #
                     # There is a synthetic self-row but no valid Gaia master: compute D² to the nearest valid master
                     mnear = None
                     if _nearest_idx is not None:
                         mnear = int(_nearest_idx)
                     else:
-                        if 'gaia_id' in combined_df.columns:
-                            valid_master_mask = (~combined_df['gaia_id'].isna()) & (combined_df['gaia_id'] != -1)
+                        cand_for_nearest = np.array(list(cand_set), dtype=int) if cand_set else np.empty(0, dtype=int)
+                        if cand_for_nearest.size:
+                            mask_valid = valid_master_mask_global[cand_for_nearest]
+                            mask_not_self = (id_series_global_str[cand_for_nearest] != new_id_str)
+                            filtered = cand_for_nearest[mask_valid & mask_not_self]
                         else:
-                            valid_master_mask = np.ones(len(combined_df), dtype=bool)
-                        try:
-                            not_self_mask = combined_df[id_col].astype(str) != str(new_id)
-                        except Exception:
-                            not_self_mask = np.ones(len(combined_df), dtype=bool)
-                        nearest_mask = valid_master_mask & not_self_mask
-                        if np.any(nearest_mask):
-                            idxs = np.where(nearest_mask)[0]
-                            dist_all = np.hypot(dx_src.iloc[idxs].values, dy_src.iloc[idxs].values)
-                            k = int(np.argmin(dist_all))
-                            mnear = int(idxs[k])
-                        _maj_use, _min_use, _pa_use, _raw_maj_use, _raw_min_use = _scaled_ellipse_by_id(key, other_df.iloc[j][id_col], id_col)
-                        Cnew = _cov_from_axes(_maj_use, _min_use, _pa_use)
-                        mrow = combined_df.iloc[mnear]
-                        try:
-                            maj_m = float(mrow['errMaj'])
-                            min_m = float(mrow['errMin'])
-                            pa_m  = float(mrow['errPA'])
-                        except Exception:
-                            maj_m = master_floor_as; min_m = master_floor_as; pa_m = 0.0
-                        if not np.isfinite(maj_m): maj_m = master_floor_as
-                        if not np.isfinite(min_m): min_m = master_floor_as
-                        maj_m = max(maj_m, master_floor_as)
-                        min_m = max(min_m, master_floor_as)
-                        Cmas = _cov_from_axes(maj_m, min_m, pa_m)
-                        if (epoch_row is not None) and ('ref_epoch' in combined_df.columns):
-                            dt_tmp_local = None
+                            filtered = np.empty(0, dtype=int)
+                        with _diag_timer(profiler, diag_log, 'nearest_fallback'):
+                            if filtered.size:
+                                dist_all = np.array([np.hypot(*_src_offset(int(idx))) for idx in filtered], dtype=float)
+                                k = int(np.argmin(dist_all))
+                                mnear = int(filtered[k])
+                            elif cand_indices:
+                                dist_all = np.array([np.hypot(*_src_offset(int(idx))) for idx in cand_indices], dtype=float)
+                                k = int(np.argmin(dist_all))
+                                mnear = int(cand_indices[k])
+                            else:
+                                raise RuntimeError('nearest index not found')
+                            _maj_use, _min_use, _pa_use, _raw_maj_use, _raw_min_use = _scaled_ellipse_by_id(key, other_df.iloc[j][id_col], id_col)
+                            Cnew = _cov_from_axes(_maj_use, _min_use, _pa_use)
+                            mrow = combined_df.iloc[mnear]
                             try:
-                                ref_ep_local = float(mrow['ref_epoch'])
-                                if np.isfinite(ref_ep_local):
-                                    dt_tmp_local = float(epoch_row - ref_ep_local)
+                                maj_m = float(mrow['errMaj'])
+                                min_m = float(mrow['errMin'])
+                                pa_m  = float(mrow['errPA'])
                             except Exception:
+                                maj_m = master_floor_as; min_m = master_floor_as; pa_m = 0.0
+                            if not np.isfinite(maj_m): maj_m = master_floor_as
+                            if not np.isfinite(min_m): min_m = master_floor_as
+                            maj_m = max(maj_m, master_floor_as)
+                            min_m = max(min_m, master_floor_as)
+                            Cmas = _cov_from_axes(maj_m, min_m, pa_m)
+                            if (epoch_row is not None) and ('ref_epoch' in combined_df.columns):
                                 dt_tmp_local = None
-                            if (dt_tmp_local is not None) and ('pmra_error' in combined_df.columns) and ('pmdec_error' in combined_df.columns):
                                 try:
-                                    sra = float(mrow['pmra_error'])
-                                    sde = float(mrow['pmdec_error'])
-                                    if np.isfinite(sra) and np.isfinite(sde):
-                                        sig_ra = abs(sra) * 0.001 * abs(dt_tmp_local)
-                                        sig_de = abs(sde) * 0.001 * abs(dt_tmp_local)
-                                        Cmas = Cmas + np.diag([sig_ra**2, sig_de**2])
+                                    ref_ep_local = float(mrow['ref_epoch'])
+                                    if np.isfinite(ref_ep_local):
+                                        dt_tmp_local = float(epoch_row - ref_ep_local)
                                 except Exception:
-                                    pass
-                        Csum = Cnew + Cmas
-                        # Guard: λ_min(Cnew+Cmas) ≥ λ_min(Cnew) + λ_min(Cmas) = min(maj_new,min_new)^2 + min(maj_m,min_m)^2
-                        try:
-                            _min_eig_bound = float(min(oth_maj_plot[j], oth_min_plot[j])**2 + min(maj_m, min_m)**2)
-                            Csum = _enforce_min_eig(Csum, _min_eig_bound)
-                        except Exception:
-                            pass
+                                    dt_tmp_local = None
+                                if (dt_tmp_local is not None) and ('pmra_error' in combined_df.columns) and ('pmdec_error' in combined_df.columns):
+                                    try:
+                                        sra = float(mrow['pmra_error'])
+                                        sde = float(mrow['pmdec_error'])
+                                        if np.isfinite(sra) and np.isfinite(sde):
+                                            sig_ra = abs(sra) * 0.001 * abs(dt_tmp_local)
+                                            sig_de = abs(sde) * 0.001 * abs(dt_tmp_local)
+                                            Cmas = Cmas + np.diag([sig_ra**2, sig_de**2])
+                                    except Exception:
+                                        pass
+                            Csum = Cnew + Cmas
+                            # Guard: λ_min(Cnew+Cmas) ≥ λ_min(Cnew) + λ_min(Cmas) = min(maj_new,min_new)^2 + min(maj_m,min_m)^2
+                            try:
+                                _min_eig_bound = float(min(oth_maj_plot[j], oth_min_plot[j])**2 + min(maj_m, min_m)**2)
+                                Csum = _enforce_min_eig(Csum, _min_eig_bound)
+                            except Exception:
+                                pass
                         invC = _safe_inv(Csum)
                         if invC is None:
                             nearest_d2 = None
@@ -3080,9 +3290,11 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                 dym = (float(g2['dec_deg']) - dec0) * 3600.0
                                 vec = np.array([dxm + pm_dx, dym + pm_dy])
                             else:
-                                vec = np.array([float(dx_src.iloc[mnear]) + pm_dx, float(dy_src.iloc[mnear]) + pm_dy])
+                                dx_near, dy_near = _src_offset(mnear)
+                                vec = np.array([dx_near + pm_dx, dy_near + pm_dy])
                         else:
-                            vec = np.array([float(dx_src.iloc[mnear]) + pm_dx, float(dy_src.iloc[mnear]) + pm_dy])
+                            dx_near2, dy_near2 = _src_offset(mnear)
+                            vec = np.array([dx_near2 + pm_dx, dy_near2 + pm_dy])
                         nearest_d2 = float(vec.dot(invC).dot(vec))
                         closest_sep_pm_arcsec = float(np.hypot(*vec))
                         try:
@@ -3092,7 +3304,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         best_master_maj = maj_m
                         best_master_min = min_m
                         best_master_pa  = pa_m
-                        if PDF_DEBUG_D2 and debug_info_lines is not None:
+                        if debug_env and debug_info_lines is not None:
                             try:
                                 evals, _ = np.linalg.eigh(Csum)
                                 evals = [float(x) for x in evals]
@@ -3124,20 +3336,23 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 if _nearest_idx is not None:
                     mnear = int(_nearest_idx)
                 else:
-                    if 'gaia_id' in combined_df.columns:
-                        valid_master_mask = (~combined_df['gaia_id'].isna()) & (combined_df['gaia_id'] != -1)
+                    cand_for_nearest = np.array(list(cand_set), dtype=int) if cand_set else np.empty(0, dtype=int)
+                    if cand_for_nearest.size:
+                        mask_valid = valid_master_mask_global[cand_for_nearest]
+                        mask_not_self = (id_series_global_str[cand_for_nearest] != new_id_str)
+                        filtered = cand_for_nearest[mask_valid & mask_not_self]
                     else:
-                        valid_master_mask = np.ones(len(combined_df), dtype=bool)
-                    try:
-                        not_self_mask = combined_df[id_col].astype(str) != str(new_id)
-                    except Exception:
-                        not_self_mask = np.ones(len(combined_df), dtype=bool)
-                    nearest_mask = valid_master_mask & not_self_mask
-                    if np.any(nearest_mask):
-                        idxs = np.where(nearest_mask)[0]
-                        dist_all = np.hypot(dx_src.iloc[idxs].values, dy_src.iloc[idxs].values)
+                        filtered = np.empty(0, dtype=int)
+                    if filtered.size:
+                        dist_all = np.array([np.hypot(*_src_offset(int(idx))) for idx in filtered], dtype=float)
                         k = int(np.argmin(dist_all))
-                        mnear = int(idxs[k])
+                        mnear = int(filtered[k])
+                    elif cand_indices:
+                        dist_all = np.array([np.hypot(*_src_offset(int(idx))) for idx in cand_indices], dtype=float)
+                        k = int(np.argmin(dist_all))
+                        mnear = int(cand_indices[k])
+                    else:
+                        raise RuntimeError('nearest index not found')
                     _maj_use, _min_use, _pa_use, _raw_maj_use, _raw_min_use = _scaled_ellipse_by_id(key, other_df.iloc[j][id_col], id_col)
                     Cnew = _cov_from_axes(_maj_use, _min_use, _pa_use)
                     mrow = combined_df.iloc[mnear]
@@ -3209,9 +3424,11 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             dym3 = (float(g3['dec_deg']) - dec0) * 3600.0
                             vec = np.array([dxm3 + pm_dx, dym3 + pm_dy])
                         else:
-                            vec = np.array([float(dx_src.iloc[mnear]) + pm_dx, float(dy_src.iloc[mnear]) + pm_dy])
+                            dx_gaia_fallback, dy_gaia_fallback = _src_offset(mnear)
+                            vec = np.array([dx_gaia_fallback + pm_dx, dy_gaia_fallback + pm_dy])
                     else:
-                        vec = np.array([float(dx_src.iloc[mnear]) + pm_dx, float(dy_src.iloc[mnear]) + pm_dy])
+                        dx_gaia_else, dy_gaia_else = _src_offset(mnear)
+                        vec = np.array([dx_gaia_else + pm_dx, dy_gaia_else + pm_dy])
                     nearest_d2 = float(vec.dot(invC).dot(vec))
                     closest_sep_pm_arcsec = float(np.hypot(*vec))
                     try:
@@ -3222,6 +3439,15 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     best_master_min = min_m
                     best_master_pa  = pa_m
 
+            if debug_env:
+                total_diag = (perf_counter() - diag_total_start) if diag_total_start is not None else 0.0
+                print(f"[diag] {key} panel {page_num}:{j} total={total_diag*1000:.1f} ms")
+                if diag_log:
+                    for name, dt in diag_log:
+                        print(f"[diag]    {name:20s} {dt*1000:.1f} ms")
+            profiler.toc('panel_diagnostics')
+            cand_indices = list(dict.fromkeys(cand_indices))
+            profiler.tic('panel_table')
             # === Dynamic association table across available catalogs (exclude current catalog) ===
             # Determine which catalogs to include based on the candidate rows; always include
             # all catalogs that precede the current one in the merge order used for the PDF/merge
@@ -3272,11 +3498,11 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             dym = (float(grow['dec_deg']) - dec0) * 3600.0
                             dist_as = float(np.hypot(dxm, dym))
                         else:
-                            dist_as = float(np.hypot(dx_src.iloc[m], dy_src.iloc[m]))
+                            dist_as = float(np.hypot(*_src_offset(m)))
                     else:
-                        dist_as = float(np.hypot(dx_src.iloc[m], dy_src.iloc[m]))
+                        dist_as = float(np.hypot(*_src_offset(m)))
                 except Exception:
-                    dist_as = float(np.hypot(dx_src.iloc[m], dy_src.iloc[m]))
+                    dist_as = float(np.hypot(*_src_offset(m)))
                 cand_with_dist.append((int(m), dist_as))
             cand_with_dist.sort(key=lambda t: t[1])
 
@@ -3441,6 +3667,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 if row_positions:
                     toggle_order = [idx for idx, _ in sorted(row_positions.items(), key=lambda kv: kv[1])]
 
+            profiler.toc('panel_table')
 
             # Title with short id for the current catalog + compact diagnostics
             short_new = _short_of(key, new_id)
@@ -3493,9 +3720,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                             dym = (float(grow['dec_deg']) - dec0) * 3600.0
                                             d = float(np.hypot(dxm, dym))
                                         else:
-                                            d = float(np.hypot(dx_src.iloc[ii], dy_src.iloc[ii]))
+                                            d = float(np.hypot(*_src_offset(ii)))
                                     else:
-                                        d = float(np.hypot(dx_src.iloc[ii], dy_src.iloc[ii]))
+                                        d = float(np.hypot(*_src_offset(ii)))
                                     if (best is None) or (d < best[1]):
                                         best = (ii, d)
                                 if best is not None:
@@ -3517,7 +3744,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                 nearest_dt = float(_res['dt']) if (_res['dt'] is not None) else nearest_dt
                             except Exception:
                                 pass
-                            if PDF_DEBUG_D2 and debug_info_lines is not None:
+                            if debug_env and debug_info_lines is not None:
                                 try:
                                     evals, _ = np.linalg.eigh(_res['Csum'])
                                     evals = [float(x) for x in evals]
@@ -3597,7 +3824,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         # Fallback legacy path removed
                 except Exception:
                     # Preserve previous value but log the error for visibility
-                    if PDF_DEBUG_D2 and debug_info_lines is not None:
+                    if debug_env and debug_info_lines is not None:
                         import traceback as _tb
                         debug_info_lines.append("D2 nearest error: " + _tb.format_exc(limit=1).strip())
                 if (nearest_d2 is not None) and np.isfinite(nearest_d2):
@@ -3639,7 +3866,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         if 'gaia_id' in combined_df.columns and (pd.isna(combined_df.iloc[_m].get('gaia_id', np.nan))
                                                                 or combined_df.iloc[_m].get('gaia_id', -1) == -1):
                             continue
-                        d_arcsec = float(np.hypot(dx_src.iloc[_m], dy_src.iloc[_m]))
+                        d_arcsec = float(np.hypot(*_src_offset(_m)))
                         if d_arcsec <= near_thr:
                             close_count += 1
             except Exception:
@@ -3672,7 +3899,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     pass
             ax.set_title(title, pad=10)
             # Annotate ellipse parameters for master and current catalog (used values) only when debugging
-            if PDF_DEBUG_D2:
+            if debug_env:
                 try:
                     new_pa = float(other_df.iloc[j]['errPA'])
                 except Exception:
@@ -3713,9 +3940,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                             dym = (float(grow['dec_deg']) - dec0) * 3600.0
                                             d = float(np.hypot(dxm, dym))
                                         else:
-                                            d = float(np.hypot(dx_src.iloc[ii], dy_src.iloc[ii]))
+                                            d = float(np.hypot(*_src_offset(ii)))
                                     else:
-                                        d = float(np.hypot(dx_src.iloc[ii], dy_src.iloc[ii]))
+                                        d = float(np.hypot(*_src_offset(ii)))
                                     if (best is None) or (d < best[1]):
                                         best = (ii, d)
                                 if best is not None:
@@ -4218,7 +4445,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                 # Skip synthetic rows if present
                                 if 'gaia_id' in combined_df.columns and (pd.isna(combined_df.iloc[_m].get('gaia_id', np.nan)) or combined_df.iloc[_m].get('gaia_id', -1) == -1):
                                     continue
-                                d_arcsec = float(np.hypot(dx_src.iloc[_m], dy_src.iloc[_m]))
+                                d_arcsec = float(np.hypot(*_src_offset(_m)))
                                 if d_arcsec <= near_thr:
                                     close_count += 1
                     except Exception:
@@ -4403,6 +4630,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     pass
             skip_html = (_html_mode == 'none') or (_html_mode in ('problems', 'problem', 'problem-only') and not page_has_problem)
 
+            profiler.tic('page_output')
             # Choose raster format for HTML image (env: HTML_IMAGE_FORMAT = png|jpg|webp)
             try:
                 _imgfmt = str(os.environ.get('HTML_IMAGE_FORMAT', 'jpg')).strip().lower()
@@ -4673,7 +4901,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     })
                 except Exception:
                     pass
-            debug_attr = ' checked' if PDF_DEBUG_D2 else ''
+            debug_attr = ' checked' if debug_env else ''
             # Write page HTML
             map_name = f"map_{key}_{page_num}"
             lines = [
@@ -4960,6 +5188,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 pass
             pdf.savefig(fig)
         plt.close(fig)
+        profiler.toc('page_output')
+        profiler.toc('page_total')
     # Close SAMP connection
     if samp_client is not None:
         try:
@@ -4981,6 +5211,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
         print(f"[index] wrote {idx_path} with {len(problem_pages)} problem pages")
     except Exception as _e:
         print(f"[index] could not write per-catalog JSON index: {_e}")
+
+    if profiler.enabled:
+        profiler.emit(f"pages={total_pages} panels={total}")
 
 
 # Modify main() to return combined_df and catalogs for interactive use
