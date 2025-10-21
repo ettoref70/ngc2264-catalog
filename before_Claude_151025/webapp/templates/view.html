@@ -1,0 +1,63 @@
+{% extends 'layout.html' %}
+{% block content %}
+  <p>Viewing: <code>{{ rel_path }}</code></p>
+  <link rel="stylesheet" href="{{ url_for('static', filename='js9/js9/js9.css') if false else url_for('static', filename='js9/js9.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='js9/js9support.css') }}" />
+  <script>
+    // Ensure JS9 uses the Flask FITS route for any relative loads
+    window.JS9Prefs = Object.assign({}, window.JS9Prefs||{}, { workDir: "/fits/", helper: false, debug: false });
+  </script>
+  <script src="{{ url_for('static', filename='js9/js9support.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js9/js9.min.js') }}"></script>
+
+  <div class="JS9Menubar" data-display="myJS9"></div>
+  <div class="JS9" id="myJS9" style="width:800px;height:800px;border:1px solid #ddd"></div>
+
+  <script>
+    (function(){
+      const rel = {{ fits_url|tojson }};
+      const relPath = {{ rel_path|tojson }};
+      // Build absolute URL for the worker to avoid base path issues
+      const fitsUrl = (function(u){ try { return new URL(u, window.location.origin).toString(); } catch(e){ return u; } })(rel);
+      const fname = (function(p){ try{ const s=p.split('/'); return s[s.length-1]||p; }catch(e){ return p; } })(relPath);
+
+      async function loadViaFetch(){
+        try{
+          const bust = (fitsUrl.indexOf('?') === -1 ? '?r=' : '&r=') + Date.now();
+          const res = await fetch(fitsUrl + bust, { cache: 'no-store' });
+          if(!res.ok){ throw new Error('HTTP ' + res.status); }
+          const blob = await res.blob();
+          JS9.Load(blob, { display: 'myJS9' });
+          return true;
+        }catch(e){ console.error('fetch load failed', e); return false; }
+      }
+
+      function tryInit(){
+        try{
+          if (window.JS9 && JS9.GetDisplays && JS9.GetDisplays().length === 0 && JS9.Init) {
+            try { JS9.Init(); } catch(e){}
+          }
+          return !!(window.JS9 && JS9.GetDisplay && JS9.GetDisplay('myJS9'));
+        }catch(e){ return false; }
+      }
+
+      async function onReady(){
+        if(!tryInit()){ setTimeout(onReady, 50); return; }
+        // Prefer loading via fetch/Blob to avoid any path resolution issues
+        const ok = await loadViaFetch();
+        if(!ok){
+          try{ JS9.Load(fitsUrl, { display: 'myJS9' }); }catch(e){ console.error('JS9.Load url failed', e); }
+        }
+      }
+
+      if (window.JS9 && JS9.OnReady){
+        JS9.OnReady(onReady);
+      } else {
+        window.addEventListener('js9Ready', onReady);
+        window.addEventListener('load', onReady);
+        document.addEventListener('DOMContentLoaded', function(){ setTimeout(onReady, 50); });
+      }
+    })();
+  </script>
+  <p style="margin-top:8px"><a href="{{ fits_url }}">Download FITS</a></p>
+{% endblock %}

@@ -28,8 +28,6 @@ script behaviour and propose improvements.
 from __future__ import annotations
 
 import sys
-import logging
-import math
 from typing import List, Optional
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -87,18 +85,6 @@ except ImportError as exc:
     print("Install dependencies with: pip install astropy astroquery pandas")
     sys.exit(1)
 
-# Configure logging for problem detection
-logger = logging.getLogger(__name__)
-# Check if we should enable debug logging via environment variable
-if _os.environ.get('PROBLEM_DETECTION_DEBUG', '0') in ('1', 'true', 'yes', 'on'):
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='[%(levelname)s] %(message)s'
-    )
-    logger.setLevel(logging.DEBUG)
-else:
-    logger.setLevel(logging.INFO)
-
 
 import os
 from pathlib import Path
@@ -116,7 +102,7 @@ import argparse
 
 # -------------------- Edit-link helpers --------------------
 CURRENT_EDITS_RADIUS: float | None = None
-NAV_KEYS_VERSION = "20251020b"
+NAV_KEYS_VERSION = "20241013a"
 
 # -------------------- Blend detection constants --------------------
 # Thresholds for identifying 2MASS blends (multiple Gaia sources in unresolved 2MASS source)
@@ -2165,62 +2151,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
     index_rows: list[dict] = []
     # Collect per-page HTML outputs
     page_files: list[str] = []
-    # Problem pages tracking (persisted across incremental generation)
-    import json as _json
-    scripts_dir = os.environ.get('ALADIN_SCRIPTS_DIR', 'aladin_scripts')
-    html_dir = os.path.join(scripts_dir, 'html')
-    try:
-        os.makedirs(html_dir, exist_ok=True)
-    except Exception:
-        pass
-    idx_path = os.path.join(html_dir, f"{key}_index.json")
-    persisted_problem_pages: set[int] = set()
-    if os.path.exists(idx_path):
-        try:
-            with open(idx_path, 'r') as _f:
-                idx_data = _json.load(_f) or {}
-            prev_list = idx_data.get('problem_pages')
-            if isinstance(prev_list, list):
-                for p in prev_list:
-                    try:
-                        persisted_problem_pages.add(int(p))
-                    except Exception:
-                        continue
-        except Exception as exc:
-            logger.warning(f"Could not read existing index {idx_path}: {exc}")
-    if not persisted_problem_pages:
-        fallback_candidates = [
-            os.path.join(html_dir, f"{key}_index_TEST.json"),
-            os.path.join(html_dir, f"{key}_index_seed.json"),
-        ]
-        radius_suffix_env = os.environ.get('ALADIN_PAGE_SUFFIX', '')
-        if radius_suffix_env:
-            fallback_candidates.extend([
-                os.path.join(html_dir, f"{key}{radius_suffix_env}_index_TEST.json"),
-                os.path.join(html_dir, f"{key}{radius_suffix_env}_index_seed.json"),
-            ])
-        for cand in fallback_candidates:
-            if not cand or not os.path.exists(cand):
-                continue
-            try:
-                with open(cand, 'r') as _f:
-                    idx_data = _json.load(_f) or {}
-                fallback_list = idx_data.get('problem_pages')
-                if isinstance(fallback_list, list):
-                    added = 0
-                    for p in fallback_list:
-                        try:
-                            persisted_problem_pages.add(int(p))
-                            added += 1
-                        except Exception:
-                            continue
-                    if added:
-                        logger.info(f"Seeded {added} problem pages from fallback index {cand}")
-            except Exception as exc:
-                logger.warning(f"Failed to load fallback index {cand}: {exc}")
-    problem_page_set: set[int] = set(persisted_problem_pages)
-    pages_marked_problem: set[int] = set()
-    pages_cleared_problem: set[int] = set()
+    # Problem pages (contain at least one to-check panel)
+    problem_pages: list[int] = []
 
     # Helpers for epochs and PM-inflated ellipse drawing
     def _epoch_from_row(row) -> Optional[float]:
@@ -2501,15 +2433,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
         _page_only = int(str(os.environ.get('ALADIN_PAGE_ONLY', '0')))
     except Exception:
         _page_only = 0
-
-    logger.info(f"Starting page generation for catalog '{key}': total={total}, per_page={per_page}, "
-                f"num_pages={math.ceil(total/per_page)}, aladin_dir={'provided' if aladin_dir else 'None'}")
-
     for start in range(0, total, per_page):
         profiler.tic('page_total')
         page_num = (start // per_page) + 1
         if _page_only > 0 and page_num != _page_only:
-            logger.debug(f"Skipping page {page_num} (ALADIN_PAGE_ONLY={_page_only})")
             continue
         end = min(start + per_page, total)
         indices = list(range(start, end))
@@ -4544,25 +4471,14 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     # Problematic if: (no identifications and a nearby master) or (an identification exists and another close-by master is present)
                     if (num_valid_master == 0 and (near_sep is not None) and (near_sep <= near_thr)):
                         is_problem = True
-                        logger.debug(f"[{base}] Problem detected: Case A (no identifications, nearby master) - "
-                                   f"num_valid_master=0, near_sep={near_sep:.3f}, near_thr={near_thr:.3f}")
                     elif (num_valid_master >= 1 and close_count >= 2):
                         is_problem = True
-                        logger.debug(f"[{base}] Problem detected: Case B (multiple nearby masters) - "
-                                   f"num_valid_master={num_valid_master}, close_count={close_count}")
                     # Also mark as problematic when a selected match has D^2 > 1
                     try:
                         if (not is_problem) and (best_d2 is not None) and np.isfinite(best_d2) and (best_d2 > 1.0):
                             is_problem = True
-                            logger.debug(f"[{base}] Problem detected: Case C (D² > 1) - best_d2={best_d2:.3f}")
                     except Exception:
                         pass
-
-                    # Log all panels for debugging
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f"[{base}] Panel j={j}, new_id={new_id}, is_problem={is_problem}, "
-                                   f"num_valid_master={num_valid_master}, near_sep={near_sep}, "
-                                   f"near_thr={near_thr:.3f}, close_count={close_count}, best_d2={best_d2}")
 
                     # Save an entry for the HTML index
                     try:
@@ -4873,19 +4789,6 @@ def plot_after_merge(combined_df: pd.DataFrame,
     return false;
   }
 
-  function _hasUnskippedProblems(){
-    try{
-      var pb = document.querySelectorAll('.panelbox');
-      for(var i=0;i<pb.length;i++){
-        var p = pb[i];
-        if(p.getAttribute('data-problem') === '1' && p.getAttribute('data-skip') !== '1'){
-          return true;
-        }
-      }
-    }catch(e){}
-    return false;
-  }
-
   function _maybeAutoAdvance(){
     try{
       var onlyOn = (function(){
@@ -4895,23 +4798,56 @@ def plot_after_merge(combined_df: pd.DataFrame,
         }catch(e){ return false; }
       })();
       if(!onlyOn) return;
-      if(_hasUnskippedProblems()) return;
-      var dir = (function(){
-        try{
-          var h = String(location.hash || '');
-          var m = h.match(/seek=(next|prev)/);
-          return m ? m[1] : 'next';
-        }catch(e){ return 'next'; }
-      })();
-      var total = _totalPages();
-      var current = Number(PAGE_NUM || 0);
-      if(!Number.isFinite(current) || current < 1){ current = 1; }
-      var target = (dir === 'prev') ? (current - 1) : (current + 1);
-      if(target < 1 || target > total){
-        return;
+      if(Array.isArray(window.PROBLEM_PAGES) && window.PROBLEM_PAGES.length){
+        if(_isProblemPage(window.PROBLEM_PAGES, PAGE_NUM)){
+          sessionStorage.removeItem('AUTO_ALADIN_SUPPRESS');
+          return;
+        }
+        var dir = (function(){
+          try{
+            var h = String(location.hash || '');
+            var m = h.match(/seek=(next|prev)/);
+            return m ? m[1] : 'next';
+          }catch(e){ return 'next'; }
+        })();
+        var pages = window.PROBLEM_PAGES.slice().map(Number).filter(Number.isFinite).sort(function(a,b){return a-b;});
+        if(pages.length){
+          var current = Number(PAGE_NUM || 0);
+          var target = current;
+          if(dir === 'prev'){
+            for(var i=pages.length-1;i>=0;i--){
+              if(pages[i] < current){ target = pages[i]; break; }
+            }
+            if(target === current) target = pages[pages.length-1];
+          }else{
+            for(var j=0;j<pages.length;j++){
+              if(pages[j] > current){ target = pages[j]; break; }
+            }
+            if(target === current) target = pages[0];
+          }
+          if(target && target !== current){
+            sessionStorage.setItem('AUTO_ALADIN_SUPPRESS','1');
+            window.location.replace(PAGE_KEY + '_page' + target + '.html#seek=' + dir);
+            return;
+          }
+        }
       }
-      if(target !== current){
-        window.location.replace(PAGE_KEY + '_page' + target + '.html#seek=' + dir);
+      var nav = (function(){
+        var navs = document.querySelectorAll('.nav');
+        for(var i=0;i<navs.length;i++){
+          var anchors = navs[i].querySelectorAll('a[href]');
+          for(var j=0;j<anchors.length;j++){
+            var a = anchors[j];
+            var t = (a.textContent || '').toLowerCase();
+            if(t.indexOf('next page') !== -1) return {href:a.getAttribute('href'), dir:'next'};
+            if(t.indexOf('prev page') !== -1) return {href:a.getAttribute('href'), dir:'prev'};
+          }
+        }
+        return null;
+      })();
+      if(nav && nav.href){
+        sessionStorage.setItem('AUTO_ALADIN_SUPPRESS','1');
+        window.location.replace(nav.href);
       }
     }catch(e){}
   }
@@ -5007,36 +4943,43 @@ def plot_after_merge(combined_df: pd.DataFrame,
     var onlyOn = !!(only && only.checked);
     if(k === 'ArrowLeft'){
       if(onlyOn){
-        e.preventDefault();
-        var currentL = Number(PAGE_NUM || 0);
-        if(!Number.isFinite(currentL) || currentL < 1){ currentL = 1; }
-        if(currentL > 1){
-          window.location.href = PAGE_KEY + '_page' + (currentL - 1) + '.html#seek=prev';
+        var pb = document.querySelectorAll('.panelbox');
+        if(!pb.length){
+          e.preventDefault();
+          window.location.replace(PAGE_KEY + '_page' + Math.max(1, PAGE_NUM-1) + '.html#seek=prev');
+          return;
         }
-        return;
+        for(var i=0;i<pb.length;i++){
+          if(isProblemPanel(pb[i]) && pb[i].getAttribute('data-skip') !== '1'){ break; }
+          if(i === pb.length-1){
+            e.preventDefault();
+            window.location.replace(PAGE_KEY + '_page' + Math.max(1, PAGE_NUM-1) + '.html#seek=prev');
+            return;
+          }
+        }
       }
       var prev = findNav('prev');
-      if(prev && prev.href){
-        e.preventDefault();
-        window.location.href = prev.href;
-      }
+      if(prev && prev.href){ e.preventDefault(); window.location.href = prev.href; }
     }
     else if(k === 'ArrowRight'){
       if(onlyOn){
-        e.preventDefault();
-        var currentR = Number(PAGE_NUM || 0);
-        if(!Number.isFinite(currentR) || currentR < 1){ currentR = 1; }
-        var totalPages = _totalPages();
-        if(currentR < totalPages){
-          window.location.href = PAGE_KEY + '_page' + (currentR + 1) + '.html#seek=next';
+        var pb2 = document.querySelectorAll('.panelbox');
+        if(!pb2.length){
+          e.preventDefault();
+          window.location.replace(PAGE_KEY + '_page' + Math.min(TOTAL_PAGES, PAGE_NUM+1) + '.html#seek=next');
+          return;
         }
-        return;
+        for(var j=0;j<pb2.length;j++){
+          if(isProblemPanel(pb2[j]) && pb2[j].getAttribute('data-skip') !== '1'){ break; }
+          if(j === pb2.length-1){
+            e.preventDefault();
+            window.location.replace(PAGE_KEY + '_page' + Math.min(TOTAL_PAGES, PAGE_NUM+1) + '.html#seek=next');
+            return;
+          }
+        }
       }
       var next = findNav('next');
-      if(next && next.href){
-        e.preventDefault();
-        window.location.href = next.href;
-      }
+      if(next && next.href){ e.preventDefault(); window.location.href = next.href; }
     }
     else if(k.toLowerCase() === 'a' && !e.ctrlKey && !e.metaKey && !e.altKey){
       if(triggerAladin()){ e.preventDefault(); }
@@ -5071,13 +5014,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
     const only=document.getElementById('only_prob');
     if(only){
       only.checked = _readOnly();
-      only.addEventListener('change', function(){
-        _writeOnly(only.checked);
-        updatePanels();
-        if(only.checked){
-          _maybeAutoAdvance();
-        }
-      });
+      only.addEventListener('change', function(){ _writeOnly(only.checked); updatePanels(); _maybeAutoAdvance(); });
     }
     updatePanels();
     _maybeAutoAdvance();
@@ -5098,24 +5035,11 @@ def plot_after_merge(combined_df: pd.DataFrame,
             if _html_mode not in ('all', 'problems', 'problem', 'problem-only', 'none'):
                 _html_mode = 'all'
             page_has_problem = any(bool(a.get('problem')) for a in page_areas) if page_areas else False
-
-            # Log page-level problem detection
-            if logger.isEnabledFor(logging.DEBUG):
-                problem_panels = [a.get('base', '?') for a in page_areas if a.get('problem')]
-                logger.debug(f"Page {page_num}: {len(page_areas)} panels, {len(problem_panels)} problematic, "
-                           f"page_has_problem={page_has_problem}")
-                if problem_panels:
-                    logger.debug(f"  Problematic panels on page {page_num}: {', '.join(problem_panels)}")
-
             if page_has_problem:
-                if page_num not in problem_page_set:
-                    pages_marked_problem.add(page_num)
-                problem_page_set.add(page_num)
-                logger.info(f"Page {page_num} marked problematic (total problem pages now {len(problem_page_set)})")
-            else:
-                if page_num in problem_page_set:
-                    pages_cleared_problem.add(page_num)
-                problem_page_set.discard(page_num)
+                try:
+                    problem_pages.append(page_num)
+                except Exception:
+                    pass
             skip_html = (_html_mode == 'none') or (_html_mode in ('problems', 'problem', 'problem-only') and not page_has_problem)
 
             profiler.tic('page_output')
@@ -5614,8 +5538,6 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 
                 f'const PAGE_KEY = {key!r}; const PAGE_NUM = {page_num}; const TOTAL_PAGES = {total_pages};\n'
                 'try{ window.PAGE_KEY = PAGE_KEY; window.PAGE_NUM = PAGE_NUM; window.TOTAL_PAGES = TOTAL_PAGES; }catch(e){}\n'
-                '// Extract actual PAGE_KEY from current URL (handles radius suffix like _r0.1)\n'
-                '(function(){ try{ var m = String(location.pathname || "").match(/([^\\/]+)_page\\d+\\.html$/); if(m && m[1]){ window.PAGE_KEY = m[1]; } }catch(e){} })();\n'
                 '// Fix Back link when served via dyn_server (HTTP), leave static default otherwise\n'
                 '(function(){ try{ var a=document.getElementById("back_link"); if(!a) return; var isHttp=/^https?:/i.test(location.protocol); var p=location.pathname||""; if(isHttp && p.indexOf("/aladin_scripts/html/")!==-1){ a.setAttribute("href","/"); } }catch(e){} })();\n'
                 'function _baseUrl(u){ try{ return (u && u.endsWith && u.endsWith("/")) ? u.slice(0,-1) : u; }catch(e){ return u; } }\n'
@@ -5652,39 +5574,17 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 'function _getSeek(){ try{ const h=String(location.hash||""); const m=h.match(/seek=(next|prev)/); return m? m[1] : "next"; }catch(e){ return "next"; } }\n'
                 'function _navToPage(n, dir){ if(typeof TOTAL_PAGES!=="number") return; if(n<1||n>TOTAL_PAGES) return; try{ const auto = document.getElementById("auto_aladin"); const only = document.getElementById("only_prob"); if(auto && only && auto.checked && only.checked){ sessionStorage.setItem("AUTO_ALADIN_SUPPRESS","1"); } }catch(e){} const href = PAGE_KEY + "_page" + n + ".html#seek=" + (dir||"next"); location.href = href; }\n'
                 'function _maybeAutoAdvance(){ try{ if(typeof maybeAutoAdvance === "function"){ maybeAutoAdvance(window.PROBLEM_PAGES || []); } }catch(e){} }\n'
-                'document.addEventListener("DOMContentLoaded", function(){ try{ const sk=_readSkip(); document.querySelectorAll(".panelbox").forEach(function(p){ const b=p.getAttribute("data-base"); if(sk[b]){ p.setAttribute("data-skip","1"); const cb=p.querySelector(".skipbox"); if(cb) cb.checked=true; } }); const only=document.getElementById("only_prob"); if(only){ only.checked = _readOnly(); only.addEventListener("change", function(){ _writeOnly(only.checked); updatePanels(); if(only.checked){ _maybeAutoAdvance(); } }); } updatePanels(); // tag Prev/Next anchors with seek\n'
+                'document.addEventListener("DOMContentLoaded", function(){ try{ const sk=_readSkip(); document.querySelectorAll(".panelbox").forEach(function(p){ const b=p.getAttribute("data-base"); if(sk[b]){ p.setAttribute("data-skip","1"); const cb=p.querySelector(".skipbox"); if(cb) cb.checked=true; } }); const only=document.getElementById("only_prob"); if(only){ only.checked = _readOnly(); only.addEventListener("change", function(){ _writeOnly(only.checked); updatePanels(); try{ if(typeof maybeAutoAdvance === "function"){ maybeAutoAdvance(window.PROBLEM_PAGES || []); } }catch(e){} }); } updatePanels(); // tag Prev/Next anchors with seek\n'
                 '  document.querySelectorAll(".nav a").forEach(function(a){ const t=(a.textContent||"").toLowerCase(); if(t.indexOf("next page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=next"; } if(t.indexOf("prev page")!==-1 || t.indexOf("« prev page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=prev"; } }); const dbg=document.getElementById("show_debug"); if(dbg){ dbg.addEventListener("change", function(){ try{ const on = !!dbg.checked; let target = "/page/" + PAGE_KEY + "/" + PAGE_NUM + "?debug=" + (on ? "1" : "0"); try{ if(window.location.search && window.location.search.indexOf("img=1") !== -1){ target += "&img=1"; } }catch(e){} const hash = window.location.hash || ""; if(hash && hash.indexOf("seek=") >= 0){ window.location.href = target + hash; } else { window.location.href = target; } }catch(e){ window.location.href = "/page/" + PAGE_KEY + "/" + PAGE_NUM + "?debug=" + (dbg.checked ? "1" : "0"); } }); } }catch(e){} });\n'
                 '</script>'
             ]
             # Remove bottom per-source nav (was unreliable without local server)
             try:
-                _prob_json = _json.dumps(sorted(problem_page_set))
+                import json as _json
+                _prob_json = _json.dumps(problem_pages)
             except Exception:
                 _prob_json = '[]'
             lines.append(f'<script>window.PAGE_HAS_PROBLEM = {"true" if page_has_problem else "false"}; window.PROBLEM_PAGES = {_prob_json};</script>')
-            # Load complete problem pages list from JSON index
-            lines.append(f'''<script>
-(function(){{
-  try{{
-    var idxKey = (typeof window.PAGE_KEY === 'string' && window.PAGE_KEY) ? window.PAGE_KEY : {key!r};
-    if(!idxKey){{
-      var m = String(window.location && window.location.pathname || '').match(/([^\\/]+)_page\\d+\\.html$/);
-      if(m && m[1]){{ idxKey = m[1]; }}
-    }}
-    if(!idxKey){{ idxKey = {key!r}; }}
-    var idxUrl = idxKey + '_index.json?_t=' + Date.now();
-    fetch(idxUrl)
-      .then(function(r){{ return r.json(); }})
-      .then(function(data){{
-        if(data && Array.isArray(data.problem_pages)){{
-          window.PROBLEM_PAGES = data.problem_pages;
-          console.log('[nav_keys] Loaded PROBLEM_PAGES from index:', window.PROBLEM_PAGES.length, 'pages');
-        }}
-      }})
-      .catch(function(e){{ console.warn('[nav_keys] Could not load index:', e); }});
-  }}catch(e){{ console.warn('[nav_keys] Index load error:', e); }}
-}})();
-</script>''')
             lines.append(f'<script src="nav_keys.js?v={NAV_KEYS_VERSION}"></script>')
             # Only write HTML if not skipped
             if not skip_html:
@@ -5720,15 +5620,14 @@ def plot_after_merge(combined_df: pd.DataFrame,
 
     # Write a minimal per-catalog JSON index to accelerate navigation
     try:
-        updated_list = sorted(problem_page_set)
+        import json as _json
+        scripts_dir = os.environ.get('ALADIN_SCRIPTS_DIR', 'aladin_scripts')
+        html_dir = os.path.join(scripts_dir, 'html')
+        os.makedirs(html_dir, exist_ok=True)
+        idx_path = os.path.join(html_dir, f"{key}_index.json")
         with open(idx_path, 'w') as f:
-            _json.dump({'total_pages': int(total), 'problem_pages': updated_list}, f)
-        print(f"[index] wrote {idx_path} with {len(updated_list)} problem pages")
-        logger.info(f"Wrote index {idx_path}: total_pages={total}, problem_pages={len(updated_list)}")
-        if pages_marked_problem:
-            logger.info(f"  Newly marked pages this run: {sorted(pages_marked_problem)}")
-        if pages_cleared_problem:
-            logger.info(f"  Cleared problem flag for pages: {sorted(pages_cleared_problem)}")
+            _json.dump({'total_pages': int(total), 'problem_pages': problem_pages}, f)
+        print(f"[index] wrote {idx_path} with {len(problem_pages)} problem pages")
     except Exception as _e:
         print(f"[index] could not write per-catalog JSON index: {_e}")
 

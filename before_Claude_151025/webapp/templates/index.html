@@ -1,0 +1,14 @@
+{% extends 'layout.html' %}
+{% block content %}
+  <p>Pick a dataset directory under <code>catalogs/</code> to browse FITS files.</p>
+  {% if not top_dirs %}
+    <p class="muted">No subdirectories found in <code>catalogs/</code>.</p>
+  {% else %}
+    <ul>
+      {% for d in top_dirs %}
+        <li><a href="{{ url_for('browse') }}?dir={{ d|urlencode }}">{{ d }}</a></li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+  <p class="subtle">Root: {{ (request.url_root ~ 'fits/') }} maps to <code>{{ ("catalogs/") }}</code>.</p>
+{% endblock %}

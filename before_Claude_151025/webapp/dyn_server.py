@@ -411,49 +411,11 @@ def create_app() -> Flask:
             radius_suffix = entry.get('radius_suffix') or cm._radius_suffix(entry.get('radius_deg'))
         base = f"{key}{radius_suffix or ''}"
         idx_path = (HTML_DIR / f"{base}_index.json")
-        data: dict = {}
         try:
             with open(idx_path, 'r') as f:
-                data = _json.load(f) or {}
+                return _json.load(f) or {}
         except Exception:
-            data = {}
-        if not data.get('problem_pages'):
-            fallbacks = [
-                HTML_DIR / f"{base}_index_TEST.json",
-                HTML_DIR / f"{key}_index.json",
-                HTML_DIR / f"{key}_index_TEST.json",
-            ]
-            if radius_suffix:
-                fallbacks.append(HTML_DIR / f"{key}{radius_suffix}_index_TEST.json")
-            merged = False
-            base_pages = set()
-            if isinstance(data.get('problem_pages'), list):
-                for p in data['problem_pages']:
-                    try:
-                        base_pages.add(int(p))
-                    except Exception:
-                        continue
-            for cand in fallbacks:
-                if cand is None or not cand.exists():
-                    continue
-                try:
-                    with open(cand, 'r') as f:
-                        fallback_data = _json.load(f) or {}
-                    flist = fallback_data.get('problem_pages')
-                    if isinstance(flist, list):
-                        for p in flist:
-                            try:
-                                base_pages.add(int(p))
-                                merged = True
-                            except Exception:
-                                continue
-                    if 'total_pages' not in data and fallback_data.get('total_pages'):
-                        data['total_pages'] = fallback_data.get('total_pages')
-                except Exception:
-                    continue
-            if merged:
-                data['problem_pages'] = sorted(base_pages)
-        return data
+            return {}
 
     def _index_total_pages(index: dict) -> int:
         for k in ('total_pages', 'pages_total', 'num_pages', 'count_pages'):

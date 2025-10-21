@@ -1,0 +1,37 @@
+{% extends 'layout.html' %}
+{% block content %}
+  <p>Directory: <code>{{ ('catalogs/' ~ (rel_dir or '')) or 'catalogs/' }}</code></p>
+  {% if subdirs %}
+    <h4>Subdirectories</h4>
+    <ul>
+      {% for sub in subdirs %}
+        <li>
+          <a href="{{ url_for('browse') }}?dir={{ sub|urlencode }}">{{ sub }}</a>
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+
+  <h4>FITS Files{% if total %} ({{ total }}){% endif %}</h4>
+  {% if files %}
+    <ul>
+      {% for f in files %}
+        <li>
+          <a href="{{ url_for('view') }}?file={{ f|urlencode }}">{{ f }}</a>
+        </li>
+      {% endfor %}
+    </ul>
+    {% if has_prev or has_next %}
+      <div class="pager">
+        {% if has_prev %}
+          <a href="{{ url_for('browse') }}?dir={{ rel_dir|urlencode }}&page={{ page-1 }}&per={{ per }}">Prev</a>
+        {% endif %}
+        {% if has_next %}
+          <a href="{{ url_for('browse') }}?dir={{ rel_dir|urlencode }}&page={{ page+1 }}&per={{ per }}">Next</a>
+        {% endif %}
+      </div>
+    {% endif %}
+  {% else %}
+    <p class="muted">No FITS files found here.</p>
+  {% endif %}
+{% endblock %}
