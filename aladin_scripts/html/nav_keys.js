@@ -240,8 +240,8 @@
           return localStorage.getItem(key) === '1';
         }catch(e){ return false; }
       })();
-      if(!onlyOn) return;
-      if(_hasUnskippedProblems()) return;
+      if(!onlyOn) return false;
+      if(_hasUnskippedProblems()) return false;
       var dir = (function(){
         try{
           var h = String(location.hash || '');
@@ -254,10 +254,21 @@
       if(!Number.isFinite(current) || current < 1){ current = 1; }
       var target = (dir === 'prev') ? (current - 1) : (current + 1);
       if(target < 1 || target > total){
-        return;
+        return false;
       }
       if(target !== current){
         window.location.replace(PAGE_KEY + '_page' + target + '.html#seek=' + dir);
+        return true;
+      }
+    }catch(e){}
+    return false;
+  }
+
+  function maybeTriggerAuto(){
+    try{
+      var cb = document.getElementById('auto_aladin');
+      if(cb && cb.checked){
+        setTimeout(function(){ triggerAladin(); }, 200);
       }
     }catch(e){}
   }
@@ -308,7 +319,7 @@
     return true;
   }
 
-  function setupAuto(){
+  function setupAuto(skipImmediate){
     try{
       var cb = document.getElementById('auto_aladin');
       if(!cb) return;
@@ -319,11 +330,14 @@
         writeAuto(cb.checked);
         if(cb.checked){
           try{ sessionStorage.removeItem('AUTO_ALADIN_SUPPRESS'); }catch(_e){}
-          setTimeout(function(){ triggerAladin(); }, 200);
+          var hopped = _maybeAutoAdvance();
+          if(!hopped){
+            maybeTriggerAuto();
+          }
         }
       });
-      if(on && !suppressed){
-        setTimeout(function(){ triggerAladin(); }, 200);
+      if(on && !suppressed && !skipImmediate){
+        maybeTriggerAuto();
       }
     }catch(e){}
   }
@@ -402,7 +416,6 @@
   }, true);
 
   document.addEventListener('DOMContentLoaded', function(){
-    setupAuto();
     try{
       const sk=_readSkip();
       document.querySelectorAll('.panelbox').forEach(function(p){
@@ -421,11 +434,18 @@
         _writeOnly(only.checked);
         updatePanels();
         if(only.checked){
-          _maybeAutoAdvance();
+          var hopped = _maybeAutoAdvance();
+          if(!hopped){
+            maybeTriggerAuto();
+          }
         }
       });
     }
     updatePanels();
-    _maybeAutoAdvance();
+    var autoHopped = _maybeAutoAdvance();
+    setupAuto(autoHopped);
+    if(!autoHopped){
+      maybeTriggerAuto();
+    }
   }, true);
 })();

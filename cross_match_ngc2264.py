@@ -116,7 +116,13 @@ import argparse
 
 # -------------------- Edit-link helpers --------------------
 CURRENT_EDITS_RADIUS: float | None = None
-NAV_KEYS_VERSION = "20251020b"
+NAV_KEYS_VERSION = "20251020c"
+
+NAV_KEYS_TEMPLATE_PATH = Path(__file__).resolve().parent / 'aladin_scripts' / 'html' / 'nav_keys.js'
+try:
+    NAV_JS_TEMPLATE = NAV_KEYS_TEMPLATE_PATH.read_text()
+except Exception:
+    NAV_JS_TEMPLATE = "// nav_keys.js missing\n"
 
 # -------------------- Blend detection constants --------------------
 # Thresholds for identifying 2MASS blends (multiple Gaia sources in unresolved 2MASS source)
@@ -3950,15 +3956,50 @@ def plot_after_merge(combined_df: pd.DataFrame,
             except Exception:
                 near_sep = None
             close_count = 0
+            close_unmatched = 0
+            close_unmatched_any = 0
             try:
                 if master_indices:
                     for _m in master_indices:
-                        if 'gaia_id' in combined_df.columns and (pd.isna(combined_df.iloc[_m].get('gaia_id', np.nan))
-                                                                or combined_df.iloc[_m].get('gaia_id', -1) == -1):
+                        skip_row = False
+                        try:
+                            skip_row = ('gaia_id' in combined_df.columns) and (
+                                pd.isna(combined_df.iloc[_m].get('gaia_id', np.nan)) or
+                                combined_df.iloc[_m].get('gaia_id', -1) == -1
+                            )
+                        except Exception:
+                            skip_row = False
+                        if skip_row:
                             continue
                         d_arcsec = float(np.hypot(*_src_offset(_m)))
                         if d_arcsec <= near_thr:
                             close_count += 1
+                            try:
+                                id_val = combined_df.iloc[_m].get(id_col, None) if id_col in combined_df.columns else None
+                                if _is_missing(id_val):
+                                    close_unmatched += 1
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            try:
+                for _cand in cand_indices:
+                    try:
+                        dx_c, dy_c = _src_offset(_cand)
+                    except Exception:
+                        continue
+                    if np.hypot(dx_c, dy_c) <= near_thr:
+                        try:
+                            if str(combined_df.iloc[_cand].get(id_col, '')) == str(new_id):
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            id_val = combined_df.iloc[_cand].get(id_col, None) if id_col in combined_df.columns else None
+                            if _is_missing(id_val):
+                                close_unmatched_any += 1
+                        except Exception:
+                            continue
             except Exception:
                 pass
             is_problem = False
@@ -3967,6 +4008,12 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 is_problem = True
             # Case B: an identification exists and there are multiple nearby masters
             elif (num_valid_master >= 1 and close_count >= 2):
+                is_problem = True
+            # Case D: an identification exists but a nearby master appears unmatched (missing id)
+            elif (num_valid_master >= 1 and close_unmatched >= 1):
+                is_problem = True
+            # Case E: any nearby master candidate (regardless of match list) is currently unmatched
+            elif close_unmatched_any >= 1:
                 is_problem = True
             # Case C: a computed Mahalanobis distance exists for the chosen match and exceeds the 1-sigma threshold
             try:
@@ -4529,15 +4576,51 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         near_thr = 3.0
                     # If there are multiple nearby masters within threshold, count them
                     close_count = 0
+                    close_unmatched = 0
+                    close_unmatched_any = 0
                     try:
                         if master_indices:
                             for _m in master_indices:
                                 # Skip synthetic rows if present
-                                if 'gaia_id' in combined_df.columns and (pd.isna(combined_df.iloc[_m].get('gaia_id', np.nan)) or combined_df.iloc[_m].get('gaia_id', -1) == -1):
+                                is_synthetic = False
+                                try:
+                                    is_synthetic = ('gaia_id' in combined_df.columns) and (
+                                        pd.isna(combined_df.iloc[_m].get('gaia_id', np.nan)) or
+                                        combined_df.iloc[_m].get('gaia_id', -1) == -1
+                                    )
+                                except Exception:
+                                    is_synthetic = False
+                                if is_synthetic:
                                     continue
                                 d_arcsec = float(np.hypot(*_src_offset(_m)))
                                 if d_arcsec <= near_thr:
                                     close_count += 1
+                                    try:
+                                        id_val = combined_df.iloc[_m].get(id_col, None) if id_col in combined_df.columns else None
+                                        if _is_missing(id_val):
+                                            close_unmatched += 1
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+                    try:
+                        for _cand in cand_indices:
+                            try:
+                                dx_c, dy_c = _src_offset(_cand)
+                            except Exception:
+                                continue
+                            if np.hypot(dx_c, dy_c) <= near_thr:
+                                try:
+                                    if str(combined_df.iloc[_cand].get(id_col, '')) == str(new_id):
+                                        continue
+                                except Exception:
+                                    pass
+                                try:
+                                    id_val = combined_df.iloc[_cand].get(id_col, None) if id_col in combined_df.columns else None
+                                    if _is_missing(id_val):
+                                        close_unmatched_any += 1
+                                except Exception:
+                                    continue
                     except Exception:
                         pass
                     is_problem = False
@@ -4550,6 +4633,14 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         is_problem = True
                         logger.debug(f"[{base}] Problem detected: Case B (multiple nearby masters) - "
                                    f"num_valid_master={num_valid_master}, close_count={close_count}")
+                    elif (num_valid_master >= 1 and close_unmatched >= 1):
+                        is_problem = True
+                        logger.debug(f"[{base}] Problem detected: Case D (close unmatched candidate) - "
+                                   f"num_valid_master={num_valid_master}, close_unmatched={close_unmatched}")
+                    elif close_unmatched_any >= 1:
+                        is_problem = True
+                        logger.debug(f"[{base}] Problem detected: Case E (nearby unmatched candidate) - "
+                                   f"close_unmatched_any={close_unmatched_any}")
                     # Also mark as problematic when a selected match has D^2 > 1
                     try:
                         if (not is_problem) and (best_d2 is not None) and np.isfinite(best_d2) and (best_d2 > 1.0):
@@ -4652,438 +4743,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
             os.makedirs(html_dir, exist_ok=True)
             try:
                 nav_js_path = os.path.join(html_dir, 'nav_keys.js')
-                nav_js = """
-// Keyboard navigation: ←/→ pages; 'a' to trigger Aladin. Bounds-aware.
-(function(){
-  var KEY_DEBUG_URL = '/api/key_debug';
-  var _mx = null;
-  var _my = null;
-
-  document.addEventListener('mousemove', function(ev){
-    _mx = ev.clientX;
-    _my = ev.clientY;
-  }, {passive:true});
-
-  function isEditable(el){
-    if(!el) return false;
-    var tag = (el.tagName || '').toUpperCase();
-    return el.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
-  }
-
-  function closest(el, sel){
-    while(el && el.nodeType === 1){
-      if(el.matches && el.matches(sel)) return el;
-      el = el.parentElement;
-    }
-    return null;
-  }
-
-  function _autoKey(){
-    try{
-      var base = (typeof PAGE_KEY === 'string' && PAGE_KEY) ? PAGE_KEY : 'global';
-      return 'AUTO_ALADIN_' + base;
-    }catch(e){
-      return 'AUTO_ALADIN_global';
-    }
-  }
-
-  function _consumeAutoSuppress(){
-    var suppressed = false;
-    try{
-      suppressed = sessionStorage.getItem('AUTO_ALADIN_SUPPRESS') === '1';
-      if(suppressed){
-        sessionStorage.removeItem('AUTO_ALADIN_SUPPRESS');
-      }
-    }catch(e){
-      suppressed = false;
-    }
-    return suppressed;
-  }
-
-  function readAuto(){
-    try{
-      var key = _autoKey();
-      var val = null;
-      if(window.localStorage){
-        val = localStorage.getItem(key);
-        if(val === null){
-          val = localStorage.getItem('AUTO_ALADIN');
-        }
-      }
-      return val === '1';
-    }catch(e){
-      return false;
-    }
-  }
-
-  function writeAuto(on){
-    try{
-      var key = _autoKey();
-      if(window.localStorage){
-        localStorage.setItem(key, on ? '1' : '0');
-        localStorage.setItem('AUTO_ALADIN', on ? '1' : '0');
-      }
-    }catch(e){}
-    if(!on){
-      try{ sessionStorage.removeItem('AUTO_ALADIN_SUPPRESS'); }catch(_e){}
-    }
-  }
-
-  function triggerAladin(){
-    var cand = null;
-    try{
-      if(typeof _mx === 'number' && typeof _my === 'number'){
-        var el = document.elementFromPoint(_mx, _my);
-        cand = closest(el, 'a.btn.al[data-ajs]');
-      }
-    }catch(e){}
-    if(!cand){
-      try{ cand = document.querySelector('a.btn.al[data-ajs]'); }catch(e){}
-    }
-    if(!cand){
-      try{ cand = document.querySelector('[data-auto-aladin=\"1\"]'); }catch(e){}
-    }
-    if(cand){
-      try{
-        cand.click();
-        return true;
-      }catch(e){}
-    }
-    try{
-      if(Array.isArray(window.ALADIN_ITEMS) && window.ALADIN_ITEMS.length){
-        var idx = (typeof window._srcIdx === 'number') ? window._srcIdx : 0;
-        if(idx < 0 || idx >= window.ALADIN_ITEMS.length){
-          idx = 0;
-        }
-        var ajs = window.ALADIN_ITEMS[idx] || window.ALADIN_ITEMS[0];
-        var base = (typeof window.SAMP_URL === 'string' && window.SAMP_URL) ? window.SAMP_URL : 'http://127.0.0.1:8765';
-        if(base && base.charAt(base.length - 1) === '/'){
-          base = base.slice(0, -1);
-        }
-        var url = base + '/run_samp?file=' + encodeURIComponent(ajs) + '&_t=' + Date.now();
-        var sink = document.getElementsByName('aladin_sink')[0];
-        if(sink){
-          try{ sink.src = url; return true; }catch(e){}
-        }
-        window.open(url, '_blank');
-        return true;
-      }
-    }catch(e){}
-    return false;
-  }
-
-  function findNav(dir){
-    dir = (dir === 'prev') ? 'prev' : 'next';
-    try{
-      var anchors = document.querySelectorAll('.nav a[href]');
-      for(var i=0;i<anchors.length;i++){
-        var a = anchors[i];
-        if(!a) continue;
-        var label = (a.textContent || '').toLowerCase();
-        if(a.dataset && a.dataset.nav){
-          var ds = String(a.dataset.nav || '').toLowerCase();
-          if(ds === dir) return a;
-        }
-        if(dir === 'prev'){
-          if(label.indexOf('prev page') !== -1 || label.indexOf('previous page') !== -1) return a;
-          if(label.indexOf('« prev') !== -1 || label.indexOf('prev «') !== -1) return a;
-        }else if(dir === 'next'){
-          if(label.indexOf('next page') !== -1) return a;
-          if(label.indexOf('» next') !== -1 || label.indexOf('next »') !== -1) return a;
-        }
-      }
-    }catch(e){}
-    try{
-      var btn = document.querySelector('.nav [data-nav=\"' + dir + '\"]');
-      if(btn){
-        var href = btn.getAttribute('href') || btn.getAttribute('data-href');
-        if(href){
-          var auto = document.createElement('a');
-          auto.setAttribute('href', href);
-          return auto;
-        }
-      }
-    }catch(e){}
-    try{
-      if(typeof PAGE_KEY === 'string' && PAGE_KEY){
-        var current = Number(PAGE_NUM || 0);
-        if(!Number.isFinite(current) || current < 1) current = 1;
-        var total = _totalPages();
-        var target = dir === 'prev' ? (current - 1) : (current + 1);
-        if(Number.isFinite(total) && total > 0){
-          if(target < 1 || target > total) return null;
-        }else if(target < 1){
-          return null;
-        }
-        if(target === current) return null;
-        var a = document.createElement('a');
-        var hash = '#seek=' + dir;
-        a.setAttribute('href', PAGE_KEY + '_page' + target + '.html' + hash);
-        return a;
-      }
-    }catch(e){}
-    try{
-      var path = String(location.pathname || '');
-      var m = path.match(/([^\\/]+)_page(\\d+)\\.html$/);
-      if(m){
-        var base = m[1];
-        var num = parseInt(m[2], 10) || 0;
-        var target2 = dir === 'prev' ? (num - 1) : (num + 1);
-        if(target2 >= 1){
-          var stub = document.createElement('a');
-          stub.setAttribute('href', base + '_page' + target2 + '.html#seek=' + dir);
-          return stub;
-        }
-      }
-    }catch(e){}
-    return null;
-  }
-
-  function _totalPages(){
-    try{
-      return (typeof TOTAL_PAGES === 'number' && TOTAL_PAGES > 0) ? TOTAL_PAGES : 1;
-    }catch(e){
-      return 1;
-    }
-  }
-
-  function logKey(evt){
-    try{
-      var params = [
-        'key=' + encodeURIComponent(evt.key || ''),
-        'code=' + encodeURIComponent(evt.code || ''),
-        'ctrl=' + (evt.ctrlKey ? '1' : '0'),
-        'alt=' + (evt.altKey ? '1' : '0'),
-        'shift=' + (evt.shiftKey ? '1' : '0'),
-        'meta=' + (evt.metaKey ? '1' : '0'),
-        'ts=' + Date.now()
-      ].join('&');
-      var img = new Image();
-      img.src = KEY_DEBUG_URL + '?' + params;
-    }catch(e){}
-  }
-
-  function _isProblemPage(list, page){
-    if(!Array.isArray(list)) return false;
-    var target = Number(page);
-    if(!Number.isFinite(target)) return false;
-    for(var i=0;i<list.length;i++){
-      if(Number(list[i]) === target) return true;
-    }
-    return false;
-  }
-
-  function _hasUnskippedProblems(){
-    try{
-      var pb = document.querySelectorAll('.panelbox');
-      for(var i=0;i<pb.length;i++){
-        var p = pb[i];
-        if(p.getAttribute('data-problem') === '1' && p.getAttribute('data-skip') !== '1'){
-          return true;
-        }
-      }
-    }catch(e){}
-    return false;
-  }
-
-  function _maybeAutoAdvance(){
-    try{
-      var onlyOn = (function(){
-        try{
-          var key = 'ONLY_PROB_' + (PAGE_KEY || '');
-          return localStorage.getItem(key) === '1';
-        }catch(e){ return false; }
-      })();
-      if(!onlyOn) return;
-      if(_hasUnskippedProblems()) return;
-      var dir = (function(){
-        try{
-          var h = String(location.hash || '');
-          var m = h.match(/seek=(next|prev)/);
-          return m ? m[1] : 'next';
-        }catch(e){ return 'next'; }
-      })();
-      var total = _totalPages();
-      var current = Number(PAGE_NUM || 0);
-      if(!Number.isFinite(current) || current < 1){ current = 1; }
-      var target = (dir === 'prev') ? (current - 1) : (current + 1);
-      if(target < 1 || target > total){
-        return;
-      }
-      if(target !== current){
-        window.location.replace(PAGE_KEY + '_page' + target + '.html#seek=' + dir);
-      }
-    }catch(e){}
-  }
-
-  function collectToggles(){
-    var buttons = Array.prototype.slice.call(document.querySelectorAll('.btn.tgl'));
-    if(!buttons.length) return buttons;
-    var panel = null;
-    if(typeof _mx === 'number' && typeof _my === 'number'){
-      var el = document.elementFromPoint(_mx, _my);
-      panel = closest(el, '.panelbox');
-      if(!panel){
-        var btn = closest(el, '.btn.tgl');
-        if(btn){ panel = closest(btn, '.panelbox'); }
-      }
-    }
-    if(panel){
-      var base = panel.getAttribute('data-base');
-      var filtered = buttons.filter(function(btn){
-        if(base){
-          var id = btn.getAttribute('data-panel');
-          if(id) return id === base;
-        }
-        return panel.contains(btn);
-      });
-      if(filtered.length) buttons = filtered;
-    }
-    buttons.sort(function(a, b){
-      var ra = a.getBoundingClientRect();
-      var rb = b.getBoundingClientRect();
-      if(Math.abs(ra.top - rb.top) > 4) return ra.top - rb.top;
-      return ra.left - rb.left;
-    });
-    return buttons;
-  }
-
-  function triggerToggle(rank){
-    var buttons = collectToggles();
-    if(!buttons.length) return false;
-    var idx = Math.min(Math.max(rank - 1, 0), buttons.length - 1);
-    var btn = buttons[idx];
-    if(!btn) return false;
-    var href = btn.getAttribute('data-href-force') || btn.getAttribute('href');
-    if(!href){
-      try{ btn.click(); return true; }catch(e){ return false; }
-    }
-    window.location.href = href;
-    return true;
-  }
-
-  function setupAuto(){
-    try{
-      var cb = document.getElementById('auto_aladin');
-      if(!cb) return;
-      var on = readAuto();
-      var suppressed = _consumeAutoSuppress();
-      cb.checked = on;
-      cb.addEventListener('change', function(){
-        writeAuto(cb.checked);
-        if(cb.checked){
-          try{ sessionStorage.removeItem('AUTO_ALADIN_SUPPRESS'); }catch(_e){}
-          setTimeout(function(){ triggerAladin(); }, 200);
-        }
-      });
-      if(on && !suppressed){
-        setTimeout(function(){ triggerAladin(); }, 200);
-      }
-    }catch(e){}
-  }
-
-  function isProblemPanel(el){
-    if(!el) return false;
-    try{ return el.getAttribute('data-problem') === '1'; }catch(e){ return false; }
-  }
-
-  if(!Array.isArray(window.PROBLEM_PAGES)){
-    window.PROBLEM_PAGES = [];
-  }
-
-  document.addEventListener('keydown', function(e){
-    if(isEditable(e.target)) return;
-    logKey(e);
-    var k = (e.key || '');
-    if(!e.ctrlKey && !e.metaKey && !e.altKey){
-      if(k === '1' || k === '2' || k === '3'){
-        if(triggerToggle(parseInt(k, 10))){
-          e.preventDefault();
-          return;
-        }
-      }
-    }
-    var only = document.getElementById('only_prob');
-    var onlyOn = !!(only && only.checked);
-    if(k === 'ArrowLeft'){
-      if(onlyOn){
-        e.preventDefault();
-        var currentL = Number(PAGE_NUM || 0);
-        if(!Number.isFinite(currentL) || currentL < 1){ currentL = 1; }
-        if(currentL > 1){
-          window.location.href = PAGE_KEY + '_page' + (currentL - 1) + '.html#seek=prev';
-        }
-        return;
-      }
-      var prev = findNav('prev');
-      if(prev && prev.href){
-        e.preventDefault();
-        window.location.href = prev.href;
-      }
-    }
-    else if(k === 'ArrowRight'){
-      if(onlyOn){
-        e.preventDefault();
-        var currentR = Number(PAGE_NUM || 0);
-        if(!Number.isFinite(currentR) || currentR < 1){ currentR = 1; }
-        var totalPages = _totalPages();
-        if(currentR < totalPages){
-          window.location.href = PAGE_KEY + '_page' + (currentR + 1) + '.html#seek=next';
-        }
-        return;
-      }
-      var next = findNav('next');
-      if(next && next.href){
-        e.preventDefault();
-        window.location.href = next.href;
-      }
-    }
-    else if(k.toLowerCase() === 'a' && !e.ctrlKey && !e.metaKey && !e.altKey){
-      if(triggerAladin()){ e.preventDefault(); }
-    }
-    else if(k.toLowerCase() === 'g' && !e.ctrlKey && !e.metaKey && !e.altKey){
-      try{
-        var inp = document.querySelector('.nav form.jump input[type=number]');
-        if(inp){ inp.focus(); inp.select(); e.preventDefault(); return; }
-      }catch(_e){}
-      try{
-        var total = _totalPages();
-        var defv = String((typeof PAGE_NUM === 'number') ? PAGE_NUM : 1);
-        var v = prompt('Go to page (1..' + total + '):', defv);
-        if(v !== null){ e.preventDefault(); gotoPage(v); return; }
-      }catch(_e){}
-    }
-  }, true);
-
-  document.addEventListener('DOMContentLoaded', function(){
-    setupAuto();
-    try{
-      const sk=_readSkip();
-      document.querySelectorAll('.panelbox').forEach(function(p){
-        const b=p.getAttribute('data-base');
-        if(sk[b]){
-          p.setAttribute('data-skip','1');
-          const cb=p.querySelector('.skipbox');
-          if(cb) cb.checked=true;
-        }
-      });
-    }catch(e){}
-    const only=document.getElementById('only_prob');
-    if(only){
-      only.checked = _readOnly();
-      only.addEventListener('change', function(){
-        _writeOnly(only.checked);
-        updatePanels();
-        if(only.checked){
-          _maybeAutoAdvance();
-        }
-      });
-    }
-    updatePanels();
-    _maybeAutoAdvance();
-  }, true);
-})();
-"""
+                nav_js = NAV_JS_TEMPLATE
                 # Always (over)write nav_js so updated bounds logic applies to all pages
                 with open(nav_js_path, 'w') as _f:
                     _f.write(nav_js)
@@ -5651,8 +5311,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 'function _hasUnskippedProblems(){ try{ const pb = document.querySelectorAll(".panelbox"); for(let i=0;i<pb.length;i++){ const p=pb[i]; if(p.getAttribute("data-problem")==="1" && p.getAttribute("data-skip")!=="1"){ return true; } } }catch(e){} return false; }\n'
                 'function _getSeek(){ try{ const h=String(location.hash||""); const m=h.match(/seek=(next|prev)/); return m? m[1] : "next"; }catch(e){ return "next"; } }\n'
                 'function _navToPage(n, dir){ if(typeof TOTAL_PAGES!=="number") return; if(n<1||n>TOTAL_PAGES) return; try{ const auto = document.getElementById("auto_aladin"); const only = document.getElementById("only_prob"); if(auto && only && auto.checked && only.checked){ sessionStorage.setItem("AUTO_ALADIN_SUPPRESS","1"); } }catch(e){} const href = PAGE_KEY + "_page" + n + ".html#seek=" + (dir||"next"); location.href = href; }\n'
-                'function _maybeAutoAdvance(){ try{ if(typeof maybeAutoAdvance === "function"){ maybeAutoAdvance(window.PROBLEM_PAGES || []); } }catch(e){} }\n'
-                'document.addEventListener("DOMContentLoaded", function(){ try{ const sk=_readSkip(); document.querySelectorAll(".panelbox").forEach(function(p){ const b=p.getAttribute("data-base"); if(sk[b]){ p.setAttribute("data-skip","1"); const cb=p.querySelector(".skipbox"); if(cb) cb.checked=true; } }); const only=document.getElementById("only_prob"); if(only){ only.checked = _readOnly(); only.addEventListener("change", function(){ _writeOnly(only.checked); updatePanels(); if(only.checked){ _maybeAutoAdvance(); } }); } updatePanels(); // tag Prev/Next anchors with seek\n'
+                'function _maybeAutoAdvance(){ try{ if(typeof maybeAutoAdvance === "function"){ return maybeAutoAdvance(window.PROBLEM_PAGES || []); } }catch(e){} return false; }\n'
+                'document.addEventListener("DOMContentLoaded", function(){ try{ const sk=_readSkip(); document.querySelectorAll(".panelbox").forEach(function(p){ const b=p.getAttribute("data-base"); if(sk[b]){ p.setAttribute("data-skip","1"); const cb=p.querySelector(".skipbox"); if(cb) cb.checked=true; } }); const only=document.getElementById("only_prob"); if(only){ only.checked = _readOnly(); only.addEventListener("change", function(){ _writeOnly(only.checked); updatePanels(); if(only.checked){ var hopped = _maybeAutoAdvance(); if(!hopped){ maybeTriggerAuto(); } } }); } updatePanels(); // tag Prev/Next anchors with seek\n'
                 '  document.querySelectorAll(".nav a").forEach(function(a){ const t=(a.textContent||"").toLowerCase(); if(t.indexOf("next page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=next"; } if(t.indexOf("prev page")!==-1 || t.indexOf("« prev page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=prev"; } }); const dbg=document.getElementById("show_debug"); if(dbg){ dbg.addEventListener("change", function(){ try{ const on = !!dbg.checked; let target = "/page/" + PAGE_KEY + "/" + PAGE_NUM + "?debug=" + (on ? "1" : "0"); try{ if(window.location.search && window.location.search.indexOf("img=1") !== -1){ target += "&img=1"; } }catch(e){} const hash = window.location.hash || ""; if(hash && hash.indexOf("seek=") >= 0){ window.location.href = target + hash; } else { window.location.href = target; } }catch(e){ window.location.href = "/page/" + PAGE_KEY + "/" + PAGE_NUM + "?debug=" + (dbg.checked ? "1" : "0"); } }); } }catch(e){} });\n'
                 '</script>'
             ]

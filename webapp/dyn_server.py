@@ -780,23 +780,50 @@ def create_app() -> Flask:
                         rec['row'] = row
                     sect.setdefault('force', []).append(rec)
             elif action == 'force':
-                if not _contains(sect.get('force', []), other, master):
-                    rec = {'other': other, 'master': master}
-                    row_hint = row or canonical_force_row or None
-                    if row_hint:
-                        rec['row'] = str(row_hint)
-                    sect.setdefault('force', []).append(rec)
-                # Remove any remove entry
-                sect['remove'] = [it for it in sect.get('remove', []) if not (str(it.get('other')) == str(other) and str(it.get('master')) == str(master))]
+                removed_prior_remove = False
+                if 'remove' in sect:
+                    before = len(sect['remove'])
+                    sect['remove'] = [
+                        it for it in sect.get('remove', [])
+                        if not (str(it.get('other')) == str(other) and str(it.get('master')) == str(master))
+                    ]
+                    removed_prior_remove = removed_prior_remove or (before != len(sect['remove']))
+                    if not sect['remove']:
+                        sect.pop('remove', None)
+                if removed_prior_remove:
+                    # Treat force as undo of a previous remove; do not add a new force entry.
+                    pass
+                else:
+                    if not _contains(sect.get('force', []), other, master):
+                        rec = {'other': other, 'master': master}
+                        row_hint = row or canonical_force_row or None
+                        if row_hint:
+                            rec['row'] = str(row_hint)
+                        sect.setdefault('force', []).append(rec)
             elif action == 'remove':
-                if not _contains(sect.get('remove', []), other, master):
-                    rec = {'other': other, 'master': master}
-                    row_hint = row or canonical_remove_row or None
-                    if row_hint:
-                        rec['row'] = str(row_hint)
-                    sect.setdefault('remove', []).append(rec)
-                # Remove any force entry
-                sect['force'] = [it for it in sect.get('force', []) if not (str(it.get('other')) == str(other) and str(it.get('master')) == str(master))]
+                removed_prior_force = False
+                if 'force' in sect:
+                    before = len(sect['force'])
+                    sect['force'] = [
+                        it for it in sect.get('force', [])
+                        if not (str(it.get('other')) == str(other) and str(it.get('master')) == str(master))
+                    ]
+                    removed_prior_force = removed_prior_force or (before != len(sect['force']))
+                    if not sect['force']:
+                        sect.pop('force', None)
+                if removed_prior_force:
+                    # Treat remove as undo of a previous force; do not add a new remove entry.
+                    pass
+                else:
+                    if not _contains(sect.get('remove', []), other, master):
+                        rec = {'other': other, 'master': master}
+                        row_hint = row or canonical_remove_row or None
+                        if row_hint:
+                            rec['row'] = str(row_hint)
+                        sect.setdefault('remove', []).append(rec)
+            # Clean up empty structures so JSON stays tidy
+            if not sect.get('force') and not sect.get('remove'):
+                data.pop(cat, None)
             # Persist
             with open(edits_path, 'w') as f:
                 _json.dump(data, f, indent=2)
