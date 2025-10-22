@@ -11,6 +11,7 @@ import sys
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -822,7 +823,7 @@ def create_app() -> Flask:
                             rec['row'] = str(row_hint)
                         sect.setdefault('remove', []).append(rec)
             # Clean up empty structures so JSON stays tidy
-            if not sect.get('force') and not sect.get('remove'):
+            if not sect.get('force') and not sect.get('remove') and not sect.get('delete'):
                 data.pop(cat, None)
             # Persist
             with open(edits_path, 'w') as f:
@@ -868,6 +869,70 @@ def create_app() -> Flask:
         except Exception as e:
             logger.exception("Error applying edit links")
             return {'ok': False, 'error': 'Failed to apply edits'}, 500
+
+    @app.route('/api/delete_source', methods=['POST'])
+    def api_delete_source():
+        import json as _json
+        payload = request.get_json(silent=True) or request.form or {}
+        cat = str(payload.get('cat', '')).strip()
+        other = str(payload.get('id') or payload.get('source') or payload.get('other') or '').strip()
+        page = int(str(payload.get('page') or '1') or 1)
+        if not cat or not other:
+            abort(400)
+        EDITS_DIR.mkdir(parents=True, exist_ok=True)
+        radius_hint = None
+        cached = DATA.get(cat)
+        if isinstance(cached, dict):
+            radius_hint = cached.get('radius_deg')
+        edits_path, data = _load_edits_for_radius(radius_hint)
+        try:
+            sect = data.get(cat)
+            if not isinstance(sect, dict):
+                sect = {}
+                data[cat] = sect
+            # Remove any lingering force/remove entries for this source
+            for key_list in ('force', 'remove'):
+                lst = sect.get(key_list)
+                if isinstance(lst, list):
+                    filtered = [rec for rec in lst if str(rec.get('other')) != str(other)]
+                    if filtered:
+                        sect[key_list] = filtered
+                    else:
+                        sect.pop(key_list, None)
+            delete_list = sect.get('delete')
+            if not isinstance(delete_list, list):
+                delete_list = []
+                sect['delete'] = delete_list
+            existing = {str(rec.get('id', rec.get('other'))) for rec in delete_list if isinstance(rec, dict)}
+            if str(other) not in existing:
+                ts = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+                delete_list.append({
+                    'id': other,
+                    'ts': ts
+                })
+            with open(edits_path, 'w') as f:
+                _json.dump(data, f, indent=2)
+        except Exception:
+            logger.exception("Error persisting delete edit")
+            return {'ok': False, 'error': 'Failed to save delete'}, 500
+
+        try:
+            for cache_key, entry in list(DATA.items()):
+                base_df = entry.get('baseline')
+                catalogs_entry = entry.get('catalogs')
+                if base_df is None or catalogs_entry is None:
+                    continue
+                try:
+                    updated = cm.apply_link_edits_to_combined(base_df, catalogs_entry, data)
+                except Exception:
+                    updated = base_df.copy(deep=True)
+                    updated.attrs['_baseline_unforced'] = base_df
+                entry['combined'] = updated
+            _ensure_pages_for(cat, page, draw_images=True, prefetch=False)
+        except Exception:
+            logger.exception("Error applying delete edit")
+            return {'ok': False, 'error': 'Failed to apply delete'}, 500
+        return {'ok': True}
 
     # Provide a compatibility route for the static index reference used by generated pages
     @app.get('/aladin_index.html')

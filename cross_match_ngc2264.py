@@ -62,6 +62,7 @@ import requests
 import time
 import json
 from typing import Dict, Any
+from html import escape
 
 try:
     from astroquery.gaia import Gaia
@@ -570,6 +571,17 @@ def _apply_edits_to_matches(combined_df: 'pd.DataFrame',
     if not edits_for_cat:
         return matches
 
+    delete_ids: set[str] = set()
+    for entry in (edits_for_cat.get('delete') or []):
+        if entry is None:
+            continue
+        if isinstance(entry, dict):
+            val = entry.get('id', entry.get('other'))
+        else:
+            val = entry
+        if val is not None:
+            delete_ids.add(str(val))
+
     # Build list of force assignments allowing multiple masters for the same 'other'
     force_list: list[tuple[Any, int]] = []
     remove_set: set[tuple[int, Any]] = set()
@@ -588,6 +600,11 @@ def _apply_edits_to_matches(combined_df: 'pd.DataFrame',
                 return list(combined_df.index[combined_df[col].astype(str) == str(val)])
         except Exception:
             return []
+
+    if delete_ids:
+        for i in range(len(matches)):
+            if matches[i]:
+                matches[i] = [oid for oid in matches[i] if str(oid) not in delete_ids]
 
     # Process removes (support optional row hint to target a specific duplicate master row)
     for rem in edits_for_cat.get('remove', []) or []:
@@ -794,15 +811,40 @@ def apply_link_edits_to_combined(base_df: 'pd.DataFrame',
             return edits_dict.get(alt) or {}
         return {}
 
+    deleted_map: dict[str, set[str]] = {}
+
     for key in ('2MASS', 'wise', 'chandra', 'xmm'):
         sect = _section_for(edits, key)
         if not sect:
+            deleted_map.pop(key, None)
             continue
         id_col = '2MASS' if key == '2MASS' else f"{key}_id"
         if id_col not in combined_df.columns:
             continue
         series = combined_df[id_col]
         sentinel = _sentinel_for(series)
+        delete_entries = sect.get('delete', []) or []
+        delete_ids: set[str] = set()
+        for entry in delete_entries:
+            if entry is None:
+                continue
+            if isinstance(entry, dict):
+                val = entry.get('id', entry.get('other'))
+            else:
+                val = entry
+            if val is not None:
+                delete_ids.add(str(val))
+        if delete_ids:
+            deleted_map[key] = set(delete_ids)
+        else:
+            deleted_map.pop(key, None)
+        if delete_ids:
+            try:
+                mask_del = series.astype(str).isin(delete_ids)
+                if mask_del.any():
+                    combined_df.loc[mask_del, id_col] = sentinel
+            except Exception:
+                pass
 
         # Removals: clear id from the specified master rows
         for rem in sect.get('remove', []) or []:
@@ -847,7 +889,22 @@ def apply_link_edits_to_combined(base_df: 'pd.DataFrame',
                 combined_df.at[target_idx, id_col] = other
 
         combined_df = _dedupe_unmatched_for_id(combined_df, id_col)
-
+        if delete_ids:
+            try:
+                mask_drop = (combined_df.get('gaia_id', _pd.Series(dtype=float)) == -1)
+                if sentinel is None:
+                    mask_drop = mask_drop & combined_df[id_col].isna()
+                else:
+                    mask_drop = mask_drop & (combined_df[id_col] == sentinel)
+                if mask_drop.any():
+                    combined_df = combined_df.loc[~mask_drop].copy()
+            except Exception:
+                pass
+    combined_df.reset_index(drop=True, inplace=True)
+    if deleted_map:
+        combined_df.attrs['_deleted_ids'] = {k: sorted(v) for k, v in deleted_map.items()}
+    else:
+        combined_df.attrs.pop('_deleted_ids', None)
     return combined_df
 
 def query_gaia(center: SkyCoord, radius: u.Quantity) -> pd.DataFrame:
@@ -2770,6 +2827,12 @@ def plot_after_merge(combined_df: pd.DataFrame,
     logger.info(f"Starting page generation for catalog '{key}': total={total}, per_page={per_page}, "
                 f"num_pages={math.ceil(total/per_page)}, aladin_dir={'provided' if aladin_dir else 'None'}")
 
+    deleted_map_attr = combined_df.attrs.get('_deleted_ids', {})
+    if isinstance(deleted_map_attr, dict):
+        deleted_ids_global = {k: {str(v) for v in (vals or [])} for k, vals in deleted_map_attr.items()}
+    else:
+        deleted_ids_global = {}
+
     for start in range(0, total, per_page):
         profiler.tic('page_total')
         page_num = (start // per_page) + 1
@@ -2787,6 +2850,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
         for ax_idx, j in enumerate(indices):
             ax = axes_flat[ax_idx]
             new_id = other_df.iloc[j][id_col]
+            deleted_ids = deleted_ids_global.get(key, set())
+            is_deleted = str(new_id) in deleted_ids
             ra0 = other_df.iloc[j]['ra_deg']
             dec0 = other_df.iloc[j]['dec_deg']
             epoch_row = _epoch_from_row(other_df.iloc[j])
@@ -2956,11 +3021,12 @@ def plot_after_merge(combined_df: pd.DataFrame,
             for k in oth_indices:
                 dx_k, dy_k = _oth_offset(k)
                 if abs(dx_k) <= margin and abs(dy_k) <= margin:
+                    ls_bg = 'dotted' if (is_deleted and k == j) else '-'
                     e = Ellipse((dx_k, dy_k),
                                 width=2*oth_maj_plot[k],
                                 height=2*oth_min_plot[k],
                                 angle=(90.0 - float(other_df.iloc[k]['errPA'])),
-                                edgecolor='lightblue', linestyle='-', fill=False)
+                                edgecolor='lightblue', linestyle=ls_bg, fill=False)
                     ax.add_patch(e)
 
             # Do not hide the synthetic self-row anymore in master-centric mode.
@@ -2979,8 +3045,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 _w_new = 2 * max(float(other_df.iloc[j]['errMaj']) * float(all_catalogs[key]['factor']), float(all_catalogs[key]['min_radius']))
                 _h_new = 2 * max(float(other_df.iloc[j]['errMin']) * float(all_catalogs[key]['factor']), float(all_catalogs[key]['min_radius']))
                 _ang_new = (90.0 - float(other_df.iloc[j]['errPA']))
+            ls_new = 'dotted' if is_deleted else '-'
             e0 = Ellipse((0, 0), width=_w_new, height=_h_new,
-                         angle=_ang_new, edgecolor=cur_color, linestyle='-', fill=False,
+                         angle=_ang_new, edgecolor=cur_color, linestyle=ls_new, fill=False,
                          label=f"new: {key}")
             ax.add_patch(e0)
 
@@ -5327,6 +5394,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 '.btn.al{background:#2ca02c}'
                 '.btn.lite{background:#1f77b4}'
                 '.btn.tgl{background:#666;padding:1px 6px;font-weight:bold;line-height:1;border-radius:3px}'
+                '.panelbox .delbtn{position:absolute;bottom:6px;left:50%;transform:translateX(-50%);padding:4px 10px;'
+                'font-size:12px;line-height:1;border:none;border-radius:4px;background:#c0392b;color:#fff;'
+                'cursor:pointer;z-index:13;opacity:.92}'
+                '.panelbox .delbtn:hover{opacity:1}'
                 '.nav{margin-bottom:8px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Arial}'
                 '.kbdbar{margin-top:12px;padding:10px 12px;background:#fff;border:1px solid rgba(0,0,0,.12);'
                 'border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,.06);display:flex;flex-wrap:wrap;gap:12px;'
@@ -5399,9 +5470,13 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     # Add panel overlay container with skip checkbox and mask for filtering
                     base_id = a.get('base', '')
                     prob = int(a.get('problem', 0))
+                    other_attr = escape(str(new_id))
+                    cat_attr = escape(str(key))
+                    del_attr = '1' if is_deleted else '0'
                     lines.append(
-                        f'<div class="panelbox" data-base="{base_id}" data-problem="{prob}" '
+                        f'<div class="panelbox" data-base="{base_id}" data-problem="{prob}" data-cat="{cat_attr}" data-other="{other_attr}" data-deleted="{del_attr}" '
                         f'style="position:absolute;left:{lp:.3f}%;top:{tp:.3f}%;width:{wp:.3f}%;height:{hp:.3f}%;z-index:8;">'
+                        f'<button type="button" class="delbtn" onclick="return deleteSource(this);">Delete</button>'
                         f'<input type="checkbox" class="skipbox" data-base="{base_id}" title="Skip" '
                         f'style="position:absolute;left:50%;top:4px;transform:translateX(-50%);z-index:12;" onclick="return toggleSkip(this);" />'
                         f'<div class="mask" style="display:none;position:absolute;left:0;top:0;width:100%;height:100%;background:rgba(255,255,255,0.85);"></div>'
@@ -5575,6 +5650,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 '  return false;\n'
                 '}\n'
                 '// Panel filtering and skip controls\n'
+                'function deleteSource(btn){ try{ const panel=btn.closest(".panelbox"); if(!panel) return false; const cat=panel.getAttribute("data-cat"); const other=panel.getAttribute("data-other"); if(!cat||!other) return false; if(!(window.confirm("Remove this source from the master catalog?"))){ return false; } btn.disabled=true; fetch("/api/delete_source",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cat:cat,id:other,page:PAGE_NUM})}).then(function(resp){ if(!resp.ok){ throw new Error(resp.status); } return resp.json().catch(function(){ return {ok:true}; }); }).then(function(payload){ if(payload && payload.ok){ location.reload(); } else { btn.disabled=false; alert((payload && payload.error) || "Delete failed."); } }).catch(function(err){ btn.disabled=false; alert("Delete failed: "+err); }); }catch(e){ alert("Delete failed."); } return false; }\n'
                 'function _readSkip(){ try{ const k = "SKIP_"+PAGE_KEY; const s = localStorage.getItem(k); return s? JSON.parse(s) : {}; }catch(e){ return {}; } }\n'
                 'function _writeSkip(obj){ try{ const k = "SKIP_"+PAGE_KEY; localStorage.setItem(k, JSON.stringify(obj)); }catch(e){} }\n'
                 'function _readOnly(){ try{ const k = "ONLY_PROB_"+PAGE_KEY; return localStorage.getItem(k)==='+'"1"'+'; }catch(e){ return false; } }\n'
@@ -5781,6 +5857,19 @@ def main() -> None:
         # Strip '_id' suffix for catalog key
         key = id_col.replace('_id', '')
         params = catalog_params[key]
+        edits_cat = edits_all.get(key, {}) if isinstance(edits_all, dict) else {}
+        if not isinstance(edits_cat, dict):
+            edits_cat = {}
+        delete_ids: set[str] = set()
+        for entry in (edits_cat.get('delete') or []):
+            if entry is None:
+                continue
+            if isinstance(entry, dict):
+                val = entry.get('id', entry.get('other'))
+            else:
+                val = entry
+            if val is not None:
+                delete_ids.add(str(val))
         # Always include RA and Dec in each catalog
         cols: list[str] = ['ra_deg', 'dec_deg']
         for ellipse in ['errMaj', 'errMin', 'errPA']:
@@ -5802,8 +5891,7 @@ def main() -> None:
             all_catalogs = catalogs,
             plot_mode = 'match'
         )
-        # Apply user edits (remove/force) for this catalog before merging
-        edits_cat = edits_all.get(key, {}) if isinstance(edits_all, dict) else {}
+        # Apply user edits (remove/force/delete) for this catalog before merging
         matches = _apply_edits_to_matches(combined_df, matches, id_col, edits_cat)
         # Record which other ids have been matched in the main Gaia-anchored pass
         matched_other_ids = set()
@@ -5869,6 +5957,8 @@ def main() -> None:
                 continue
             # Handle first match in place
             first_oid = matched_ids[0]
+            if str(first_oid) in deleted_ids:
+                continue
             matched_other_ids.add(first_oid)
             # Robust lookup of the matched other-row (handle mixed id types)
             other_row = _safe_lookup_other_row(first_oid)
@@ -5896,6 +5986,8 @@ def main() -> None:
             combined_df.at[i, id_col] = first_oid
             # Duplicate for any additional matches
             for oid in matched_ids[1:]:
+                if str(oid) in deleted_ids:
+                    continue
                 matched_other_ids.add(oid)
                 # Use robust lookup for additional matches as well
                 other_row = _safe_lookup_other_row(oid)
@@ -5956,6 +6048,8 @@ def main() -> None:
         for j, ids in enumerate(rev_matches):
             if not ids:
                 other_row = df_other.iloc[j]
+                if str(other_row[id_col]) in deleted_ids:
+                    continue
                 # Scale ellipse and enforce minimum radius
                 maj   = max(other_row['errMaj'] * params['factor'],
                             params['min_radius'])
@@ -6012,6 +6106,7 @@ def main() -> None:
     #     'gaia_id', '2MASS', 'wise_id', 'chandra_id', 'xmm_id'
     # ]
     # combined_df = combined_df[id_columns]
+    combined_df.reset_index(drop=True, inplace=True)
     combined_df.to_csv('ngc2264_combined.csv', index=False)
     print(f"Master catalog written to ngc2264_combined.csv ({len(combined_df)} rows)")
 
@@ -6154,6 +6249,19 @@ def build_data_for_web(refresh: bool = False,
             continue
         key = id_col.replace('_id', '')
         params = catalog_params[key]
+        edits_cat = (edits.get(key) if isinstance(edits, dict) else {}) if edits is not None else {}
+        if not isinstance(edits_cat, dict):
+            edits_cat = {}
+        delete_ids: set[str] = set()
+        for entry in (edits_cat.get('delete') or []):
+            if entry is None:
+                continue
+            if isinstance(entry, dict):
+                val = entry.get('id', entry.get('other'))
+            else:
+                val = entry
+            if val is not None:
+                delete_ids.add(str(val))
         cols: list[str] = ['ra_deg', 'dec_deg']
         for ellipse in ['errMaj', 'errMin', 'errPA']:
             if ellipse in df_other.columns:
@@ -6172,8 +6280,7 @@ def build_data_for_web(refresh: bool = False,
             all_catalogs = catalogs,
             plot_mode = 'match'
         )
-        # Apply user edits (remove/force) for this catalog before merging
-        edits_cat = (edits.get(key) if isinstance(edits, dict) else {}) if edits is not None else {}
+        # Apply user edits (remove/force/delete) for this catalog before merging
         matches = _apply_edits_to_matches(combined_df, matches, id_col, edits_cat)
         # Initialize id column with the same dtype and sentinel
         col_dtype = df_other[id_col].dtype
@@ -6209,6 +6316,8 @@ def build_data_for_web(refresh: bool = False,
             if not matched_ids:
                 continue
             first_oid = matched_ids[0]
+            if str(first_oid) in delete_ids:
+                continue
             other_row = _safe_lookup_other_row(first_oid)
             if other_row is None:
                 print(f"[web] warn: couldn't resolve {id_col} id {first_oid!r} in catalog index; skipping")
@@ -6224,6 +6333,8 @@ def build_data_for_web(refresh: bool = False,
                 combined_df.at[i, 'errPA']   = scaled_pa
             combined_df.at[i, id_col] = first_oid
             for oid in matched_ids[1:]:
+                if str(oid) in delete_ids:
+                    continue
                 try:
                     lookup_key = int(oid)
                 except ValueError:
@@ -6266,6 +6377,8 @@ def build_data_for_web(refresh: bool = False,
         for j, ids in enumerate(rev_matches):
             if not ids:
                 other_row = df_other.iloc[j]
+                if str(other_row[id_col]) in delete_ids:
+                    continue
                 maj = max(other_row['errMaj'] * params['factor'], params['min_radius'])
                 min_ = max(other_row['errMin'] * params['factor'], params['min_radius'])
                 pa = other_row['errPA']
@@ -6299,6 +6412,7 @@ def build_data_for_web(refresh: bool = False,
         # Fall back to the pre-edit catalogue if anything goes wrong
         pass
 
+    combined_df.reset_index(drop=True, inplace=True)
     return combined_df, catalogs
 
 
