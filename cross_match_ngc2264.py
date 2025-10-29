@@ -118,7 +118,7 @@ import argparse
 
 # -------------------- Edit-link helpers --------------------
 CURRENT_EDITS_RADIUS: float | None = None
-NAV_KEYS_VERSION = "20251020c"
+NAV_KEYS_VERSION = "20251023d"
 
 NAV_KEYS_TEMPLATE_PATH = Path(__file__).resolve().parent / 'aladin_scripts' / 'html' / 'nav_keys.js'
 NAV_KEYS_MINIMAL = (
@@ -1592,12 +1592,23 @@ def chain_other_to_unmatched_master(combined_df: pd.DataFrame,
         return combined_df
 
     # Precompute other catalog ellipse (scaled and min-clipped) in arcsec
-    oth_maj_as = pd.to_numeric(other_df['errMaj'], errors='coerce').astype(float)
-    oth_min_as = pd.to_numeric(other_df['errMin'], errors='coerce').astype(float)
+    oth_maj_raw = pd.to_numeric(other_df['errMaj'], errors='coerce').astype(float)
+    oth_min_raw = pd.to_numeric(other_df['errMin'], errors='coerce').astype(float)
     oth_pa_deg = pd.to_numeric(other_df['errPA'], errors='coerce').astype(float)
-    min_as = float(min_radius_arcsec)
-    oth_maj_as = np.maximum(np.where(np.isfinite(oth_maj_as), oth_maj_as, min_as) * float(factor), min_as)
-    oth_min_as = np.maximum(np.where(np.isfinite(oth_min_as), oth_min_as, min_as) * float(factor), min_as)
+    default_factor = float(factor)
+    default_min = float(min_radius_arcsec)
+    match_factors = np.full(len(other_df), default_factor, dtype=float)
+    if 'match_factor' in other_df.columns:
+        mf = pd.to_numeric(other_df['match_factor'], errors='coerce').to_numpy()
+        match_factors = np.where(np.isfinite(mf), mf, match_factors)
+    match_min = np.full(len(other_df), default_min, dtype=float)
+    if 'match_min_radius' in other_df.columns:
+        mm = pd.to_numeric(other_df['match_min_radius'], errors='coerce').to_numpy()
+        match_min = np.where(np.isfinite(mm), np.maximum(mm, default_min), match_min)
+    oth_maj_as = np.where(np.isfinite(oth_maj_raw), oth_maj_raw, default_min)
+    oth_min_as = np.where(np.isfinite(oth_min_raw), oth_min_raw, default_min)
+    oth_maj_as = np.maximum(oth_maj_as * match_factors, match_min)
+    oth_min_as = np.maximum(oth_min_as * match_factors, match_min)
 
     def _cov_from_axes_arcsec(maj_as, min_as, pa_deg):
         phi = np.deg2rad(pa_deg)
@@ -1653,12 +1664,21 @@ def chain_other_to_unmatched_master(combined_df: pd.DataFrame,
                 other_row = None
             if other_row is not None:
                 try:
+                    row_factor = float(other_row.get('match_factor', default_factor))
+                except Exception:
+                    row_factor = default_factor
+                try:
+                    row_min_radius = float(other_row.get('match_min_radius', default_min))
+                except Exception:
+                    row_min_radius = default_min
+                row_min_radius = max(row_min_radius, default_min)
+                try:
                     # Scale other ellipse and enforce min radius
-                    maj_o = max(float(other_row['errMaj']) * float(factor), float(min_radius_arcsec))
-                    min_o = max(float(other_row['errMin']) * float(factor), float(min_radius_arcsec))
+                    maj_o = max(float(other_row['errMaj']) * row_factor, row_min_radius)
+                    min_o = max(float(other_row['errMin']) * row_factor, row_min_radius)
                     pa_o  = float(other_row['errPA'])
                 except Exception:
-                    maj_o = float(min_radius_arcsec); min_o = float(min_radius_arcsec); pa_o = 0.0
+                    maj_o = row_min_radius; min_o = row_min_radius; pa_o = 0.0
                 try:
                     maj_m = float(combined_df.at[i, 'errMaj']); min_m = float(combined_df.at[i, 'errMin'])
                 except Exception:
@@ -1749,6 +1769,21 @@ def cross_match(source_df: pd.DataFrame,
         return [[] for _ in range(len(source_df))]
 
     pdf = PdfPages(pdf_path) if pdf_path else None
+    n_other = len(other_df)
+    factor_default = float(scale_factor)
+    min_radius_arcsec_default = float(min_radius.to(u.arcsec).value)
+    min_deg_default = min_radius_arcsec_default / 3600.0
+    if 'match_factor' in other_df.columns:
+        row_factors = pd.to_numeric(other_df['match_factor'], errors='coerce').to_numpy()
+        row_factors = np.where(np.isfinite(row_factors), row_factors, factor_default)
+    else:
+        row_factors = np.full(n_other, factor_default, dtype=float)
+    if 'match_min_radius' in other_df.columns:
+        mm = pd.to_numeric(other_df['match_min_radius'], errors='coerce').to_numpy()
+        row_min_arcsec = np.where(np.isfinite(mm), np.maximum(mm, min_radius_arcsec_default), min_radius_arcsec_default)
+    else:
+        row_min_arcsec = np.full(n_other, min_radius_arcsec_default, dtype=float)
+    row_min_deg = row_min_arcsec / 3600.0
 
     # The SkyCoord constructions below were unused; matching is done purely
     # via small–angle approximations in Cartesian space.  They have been
@@ -1820,7 +1855,6 @@ def cross_match(source_df: pd.DataFrame,
     # IMPORTANT: source_df ellipses are already scaled/clipped upstream according to their own
     # catalog policy (e.g., Gaia ×2 and min 0.05"). Do NOT rescale them here with the
     # secondary catalog's factor/min; just convert to degrees and ensure a tiny positive floor.
-    min_deg = min_radius.to(u.deg).value
     eps_deg = 1e-6 / 3600.0
     src_maj = np.maximum((source_df['errMaj']).values / 3600.0, eps_deg)  # deg
     src_min = np.maximum((source_df['errMin']).values / 3600.0, eps_deg)  # deg
@@ -1845,8 +1879,8 @@ def cross_match(source_df: pd.DataFrame,
         src_cov[i] = cov
 
     # Precompute 2x2 covariance matrices for other objects
-    oth_maj = np.maximum((other_df['errMaj'] * scale_factor).values / 3600.0, min_deg)  # deg
-    oth_min = np.maximum((other_df['errMin'] * scale_factor).values / 3600.0, min_deg)  # deg
+    oth_maj = np.maximum((other_df['errMaj'].values * row_factors) / 3600.0, row_min_deg)  # deg
+    oth_min = np.maximum((other_df['errMin'].values * row_factors) / 3600.0, row_min_deg)  # deg
     oth_pa  = np.deg2rad(other_df['errPA'].values)  # radians
     n_oth = len(other_df)
     oth_cov = np.zeros((n_oth, 2, 2))
@@ -2013,11 +2047,10 @@ def cross_match(source_df: pd.DataFrame,
         total = len(other_df)
         # Precompute semi-axes for plotting according to plot_mode
         if plot_mode == 'match':
-            _min_arcsec = float(min_radius.to(u.arcsec).value)
             # Scale only the secondary catalog's ellipse for plotting; the master/source ellipses
             # are already pre-scaled/clipped upstream (e.g., Gaia ×2 and min 0.05").
-            oth_maj_plot = np.maximum(other_df['errMaj'].values * scale_factor, _min_arcsec)
-            oth_min_plot = np.maximum(other_df['errMin'].values * scale_factor, _min_arcsec)
+            oth_maj_plot = np.maximum(other_df['errMaj'].values * row_factors, row_min_arcsec)
+            oth_min_plot = np.maximum(other_df['errMin'].values * row_factors, row_min_arcsec)
             src_maj_plot = source_df['errMaj'].values
             src_min_plot = source_df['errMin'].values
         else:
@@ -2148,8 +2181,15 @@ def cross_match(source_df: pd.DataFrame,
                             dxm = (crow['ra_deg'] - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
                             dym = (crow['dec_deg'] - dec0) * 3600.0
                             if plot_mode == 'match' and all_catalogs is not None and key in all_catalogs:
-                                _f = float(all_catalogs[key].get('factor', 1.0))
-                                _mr = float(all_catalogs[key].get('min_radius', 0.0))
+                                try:
+                                    _f = float(crow.get('match_factor', all_catalogs[key].get('factor', 1.0)))
+                                except Exception:
+                                    _f = float(all_catalogs[key].get('factor', 1.0))
+                                try:
+                                    _mr = float(crow.get('match_min_radius', all_catalogs[key].get('min_radius', 0.0)))
+                                except Exception:
+                                    _mr = float(all_catalogs[key].get('min_radius', 0.0))
+                                _mr = max(_mr, float(all_catalogs[key].get('min_radius', 0.0)))
                                 _maj_m = max(float(crow['errMaj']) * _f, _mr)
                                 _min_m = max(float(crow['errMin']) * _f, _mr)
                             else:
@@ -2422,8 +2462,16 @@ def plot_after_merge(combined_df: pd.DataFrame,
                      samp_addr: str | None = None) -> None:
     key = id_col.replace('_id', '')
     params = all_catalogs.get(key, {}) if isinstance(all_catalogs, dict) else {}
-    factor = float(params.get('factor', 1.0))
-    min_r = float(params.get('min_radius', 0.0))
+    factor_default = float(params.get('factor', 1.0))
+    min_radius_arcsec_default = float(params.get('min_radius', 0.0))
+    row_factors = np.full(len(other_df), factor_default, dtype=float)
+    if 'match_factor' in other_df.columns:
+        mf = pd.to_numeric(other_df['match_factor'], errors='coerce').to_numpy()
+        row_factors = np.where(np.isfinite(mf), mf, row_factors)
+    row_min_arcsec = np.full(len(other_df), min_radius_arcsec_default, dtype=float)
+    if 'match_min_radius' in other_df.columns:
+        mm = pd.to_numeric(other_df['match_min_radius'], errors='coerce').to_numpy()
+        row_min_arcsec = np.where(np.isfinite(mm), np.maximum(mm, min_radius_arcsec_default), row_min_arcsec)
     # Color palette per catalog (consistent across plot and table)
     CAT_COLORS = {
         'gaia':    '#1f77b4',  # blue
@@ -2441,6 +2489,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
     cur_color = CAT_COLORS.get(key, '#17becf')  # color for the current (new) catalog
 
     profile_enabled = str(os.environ.get('ALADIN_PROFILE', '0')).strip().lower() in ('1', 'true', 'yes', 'on')
+    pdf = PdfPages(pdf_path) if pdf_path else None
     profiler = _PlotProfiler(profile_enabled, prefix=f"plot_after_merge[{key}]")
 
     # Avoid pyplot figure warning for many pages
@@ -2686,8 +2735,14 @@ def plot_after_merge(combined_df: pd.DataFrame,
             raw_maj = float(_r['errMaj']); raw_min = float(_r['errMin']); pa = float(_r['errPA'])
         except Exception as e:
             raise ValueError(f"invalid raw ellipse for id {_id_val!r}: {e}")
-        _factor = float(_meta.get('factor', 1.0))
-        _minr  = float(_meta.get('min_radius', 0.0))
+        try:
+            _factor = float(_r.get('match_factor', _meta.get('factor', 1.0)))
+        except Exception:
+            _factor = float(_meta.get('factor', 1.0))
+        try:
+            _minr = float(_r.get('match_min_radius', _meta.get('min_radius', 0.0)))
+        except Exception:
+            _minr = float(_meta.get('min_radius', 0.0))
         maj_sc = max(raw_maj * _factor, _minr)
         min_sc = max(raw_min * _factor, _minr)
         return maj_sc, min_sc, pa, raw_maj, raw_min
@@ -2725,7 +2780,6 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     and ((isinstance(val, float) and np.isnan(val)) or val == -1)))
 
     profiler.tic('precompute')
-    pdf = PdfPages(pdf_path) if pdf_path else None
     per_page = ncols * nrows
     total = len(other_df)
     import math as _math
@@ -2733,8 +2787,8 @@ def plot_after_merge(combined_df: pd.DataFrame,
 
     # Precompute new-catalog ellipse axes for plotting
     if plot_mode == 'match':
-        oth_maj_plot = np.maximum(other_df['errMaj'].values * factor, min_r)
-        oth_min_plot = np.maximum(other_df['errMin'].values * factor, min_r)
+        oth_maj_plot = np.maximum(other_df['errMaj'].values * row_factors, row_min_arcsec)
+        oth_min_plot = np.maximum(other_df['errMin'].values * row_factors, row_min_arcsec)
     else:
         oth_maj_plot = other_df['errMaj'].values
         oth_min_plot = other_df['errMin'].values
@@ -3042,8 +3096,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 _ang_new = (90.0 - _pa_use)
             except Exception:
                 # If lookup by ID fails, do not silently substitute; use current row values
-                _w_new = 2 * max(float(other_df.iloc[j]['errMaj']) * float(all_catalogs[key]['factor']), float(all_catalogs[key]['min_radius']))
-                _h_new = 2 * max(float(other_df.iloc[j]['errMin']) * float(all_catalogs[key]['factor']), float(all_catalogs[key]['min_radius']))
+                row_factor_fallback = float(row_factors[j]) if j < len(row_factors) else float(all_catalogs[key]['factor'])
+                row_min_fallback = float(row_min_arcsec[j]) if j < len(row_min_arcsec) else float(all_catalogs[key]['min_radius'])
+                _w_new = 2 * max(float(other_df.iloc[j]['errMaj']) * row_factor_fallback, row_min_fallback)
+                _h_new = 2 * max(float(other_df.iloc[j]['errMin']) * row_factor_fallback, row_min_fallback)
                 _ang_new = (90.0 - float(other_df.iloc[j]['errPA']))
             ls_new = 'dotted' if is_deleted else '-'
             e0 = Ellipse((0, 0), width=_w_new, height=_h_new,
@@ -3143,8 +3199,15 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             dxm = (crow['ra_deg'] - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
                             dym = (crow['dec_deg'] - dec0) * 3600.0
                             if plot_mode == 'match' and kcat in all_catalogs:
-                                _f = float(all_catalogs[kcat].get('factor', 1.0))
-                                _mr = float(all_catalogs[kcat].get('min_radius', 0.0))
+                                try:
+                                    _f = float(crow.get('match_factor', all_catalogs[kcat].get('factor', 1.0)))
+                                except Exception:
+                                    _f = float(all_catalogs[kcat].get('factor', 1.0))
+                                try:
+                                    _mr = float(crow.get('match_min_radius', all_catalogs[kcat].get('min_radius', 0.0)))
+                                except Exception:
+                                    _mr = float(all_catalogs[kcat].get('min_radius', 0.0))
+                                _mr = max(_mr, float(all_catalogs[kcat].get('min_radius', 0.0)))
                                 _maj_m = max(float(crow['errMaj']) * _f, _mr)
                                 _min_m = max(float(crow['errMin']) * _f, _mr)
                             else:
@@ -3265,8 +3328,15 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     dxm = (crow['ra_deg'] - ra0) * np.cos(np.deg2rad(dec0)) * 3600.0
                     dym = (crow['dec_deg'] - dec0) * 3600.0
                     if plot_mode == 'match' and kcat in all_catalogs:
-                        _f = float(all_catalogs[kcat].get('factor', 1.0))
-                        _mr = float(all_catalogs[kcat].get('min_radius', 0.0))
+                        try:
+                            _f = float(crow.get('match_factor', all_catalogs[kcat].get('factor', 1.0)))
+                        except Exception:
+                            _f = float(all_catalogs[kcat].get('factor', 1.0))
+                        try:
+                            _mr = float(crow.get('match_min_radius', all_catalogs[kcat].get('min_radius', 0.0)))
+                        except Exception:
+                            _mr = float(all_catalogs[kcat].get('min_radius', 0.0))
+                        _mr = max(_mr, float(all_catalogs[kcat].get('min_radius', 0.0)))
                         _maj_m = max(float(crow['errMaj']) * _f, _mr)
                         _min_m = max(float(crow['errMin']) * _f, _mr)
                     else:
@@ -4446,8 +4516,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         raw_maj = float(other_df.iloc[j]['errMaj'])
                         raw_min = float(other_df.iloc[j]['errMin'])
                     # Scale by per-catalog factor and clip to per-catalog min_radius (arcsec)
-                    maj_sc = max(raw_maj * factor, min_r)
-                    min_sc = max(raw_min * factor, min_r)
+                    row_factor_dbg = float(row_factors[j]) if j < len(row_factors) else factor_default
+                    row_min_dbg = float(row_min_arcsec[j]) if j < len(row_min_arcsec) else min_radius_arcsec_default
+                    maj_sc = max(raw_maj * row_factor_dbg, row_min_dbg)
+                    min_sc = max(raw_min * row_factor_dbg, row_min_dbg)
                     txt_new = (
                         f"{key}: maj={maj_sc:.2f}″ min={min_sc:.2f}″ PA={new_pa:.1f}° "
                         f"(raw: {raw_maj:.2f}/{raw_min:.2f})"
@@ -5659,10 +5731,10 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 'function updatePanels(){ try{ const only = document.getElementById("only_prob"); const onlyOn = !!(only && only.checked); const pb = document.querySelectorAll(".panelbox"); pb.forEach(function(p){ const prob = p.getAttribute("data-problem")==="1"; const skip = p.getAttribute("data-skip")==="1"; const mask = p.querySelector(".mask"); let show = true; if(onlyOn){ show = prob && !skip; } else { show = !skip; } if(mask){ mask.style.display = show? "none" : "block"; } }); }catch(e){} return false; }\n'
                 'function _hasUnskippedProblems(){ try{ const pb = document.querySelectorAll(".panelbox"); for(let i=0;i<pb.length;i++){ const p=pb[i]; if(p.getAttribute("data-problem")==="1" && p.getAttribute("data-skip")!=="1"){ return true; } } }catch(e){} return false; }\n'
                 'function _getSeek(){ try{ const h=String(location.hash||""); const m=h.match(/seek=(next|prev)/); return m? m[1] : "next"; }catch(e){ return "next"; } }\n'
-                'function _navToPage(n, dir){ if(typeof TOTAL_PAGES!=="number") return; if(n<1||n>TOTAL_PAGES) return; try{ const auto = document.getElementById("auto_aladin"); const only = document.getElementById("only_prob"); if(auto && only && auto.checked && only.checked){ sessionStorage.setItem("AUTO_ALADIN_SUPPRESS","1"); } }catch(e){} const href = PAGE_KEY + "_page" + n + ".html#seek=" + (dir||"next"); location.href = href; }\n'
+                'function _navToPage(n, dir, opts){ if(typeof TOTAL_PAGES!=="number") return; if(n<1||n>TOTAL_PAGES) return; const key = (typeof window.PAGE_KEY==="string" && window.PAGE_KEY) ? window.PAGE_KEY : PAGE_KEY; try{ const auto = document.getElementById("auto_aladin"); const onlyBox = document.getElementById("only_prob"); if(auto && onlyBox && auto.checked && onlyBox.checked){ sessionStorage.setItem("AUTO_ALADIN_SUPPRESS","1"); } }catch(e){} let params; try{ params = new URLSearchParams(window.location.search||""); }catch(e){ params = null; } if(!params){ params = new URLSearchParams(); } let onlyOn = false; try{ const box = document.getElementById("only_prob"); onlyOn = !!(box && box.checked); }catch(e){} if(onlyOn){ params.set("only","to_check"); params.set("img","skip"); } else { params.delete("only"); if(params.get("img")==="skip"){ params.delete("img"); } params.delete("bg"); } if(opts && Object.prototype.hasOwnProperty.call(opts,"img")){ if(opts.img === null){ params.delete("img"); } else { params.set("img", String(opts.img)); } } if(opts && Object.prototype.hasOwnProperty.call(opts,"bg")){ if(opts.bg === null){ params.delete("bg"); } else { params.set("bg", String(opts.bg)); } } if(opts && Object.prototype.hasOwnProperty.call(opts,"debug")){ params.set("debug", opts.debug ? "1" : "0"); } const query = params.toString(); let href = key + "_page" + n + ".html"; if(query){ href += "?" + query; } href += "#seek=" + (dir||"next"); if(opts && opts.replace){ window.location.replace(href); } else { window.location.href = href; } }\n'
                 'function _maybeAutoAdvance(){ try{ if(typeof maybeAutoAdvance === "function"){ return maybeAutoAdvance(window.PROBLEM_PAGES || []); } }catch(e){} return false; }\n'
                 'document.addEventListener("DOMContentLoaded", function(){ try{ const sk=_readSkip(); document.querySelectorAll(".panelbox").forEach(function(p){ const b=p.getAttribute("data-base"); if(sk[b]){ p.setAttribute("data-skip","1"); const cb=p.querySelector(".skipbox"); if(cb) cb.checked=true; } }); const only=document.getElementById("only_prob"); if(only){ only.checked = _readOnly(); only.addEventListener("change", function(){ _writeOnly(only.checked); updatePanels(); if(only.checked){ var hopped = _maybeAutoAdvance(); if(!hopped){ maybeTriggerAuto(); } } }); } updatePanels(); // tag Prev/Next anchors with seek\n'
-                '  document.querySelectorAll(".nav a").forEach(function(a){ const t=(a.textContent||"").toLowerCase(); if(t.indexOf("next page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=next"; } if(t.indexOf("prev page")!==-1 || t.indexOf("« prev page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=prev"; } }); const dbg=document.getElementById("show_debug"); if(dbg){ dbg.addEventListener("change", function(){ try{ const on = !!dbg.checked; let target = "/page/" + PAGE_KEY + "/" + PAGE_NUM + "?debug=" + (on ? "1" : "0"); try{ if(window.location.search && window.location.search.indexOf("img=1") !== -1){ target += "&img=1"; } }catch(e){} const hash = window.location.hash || ""; if(hash && hash.indexOf("seek=") >= 0){ window.location.href = target + hash; } else { window.location.href = target; } }catch(e){ window.location.href = "/page/" + PAGE_KEY + "/" + PAGE_NUM + "?debug=" + (dbg.checked ? "1" : "0"); } }); } }catch(e){} });\n'
+                '  document.querySelectorAll(".nav a").forEach(function(a){ const label=(a.textContent||"").toLowerCase(); if(label.indexOf("next page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=next"; } if(label.indexOf("prev page")!==-1 || label.indexOf("« prev page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=prev"; } a.addEventListener("click", function(ev){ try{ if(typeof _navToPage !== "function") return; const raw = a.getAttribute("href") || ""; const match = raw.match(/_page(\\d+)\\.html/); if(!match) return; ev.preventDefault(); const target = parseInt(match[1],10); const seek = (raw.indexOf("#seek=prev")!==-1 || label.indexOf("prev page")!==-1) ? "prev" : "next"; _navToPage(target, seek); }catch(err){} }); }); const dbg=document.getElementById("show_debug"); if(dbg){ dbg.addEventListener("change", function(){ try{ const on = !!dbg.checked; let target = "/page/" + PAGE_KEY + "/" + PAGE_NUM + "?debug=" + (on ? "1" : "0"); try{ if(window.location.search && window.location.search.indexOf("img=1") !== -1){ target += "&img=1"; } }catch(e){} const hash = window.location.hash || ""; if(hash && hash.indexOf("seek=") >= 0){ window.location.href = target + hash; } else { window.location.href = target; } }catch(e){ window.location.href = "/page/" + PAGE_KEY + "/" + PAGE_NUM + "?debug=" + (dbg.checked ? "1" : "0"); } }); } }catch(e){} });\n'
                 '</script>'
             ]
             # Remove bottom per-source nav (was unreliable without local server)
@@ -5806,6 +5878,24 @@ def main() -> None:
     tmass = query_2mass(center, radius)
     print(f"Retrieved {len(tmass)} 2MASS sources (raw)")
     tmass = filter_2mass_quality(tmass)
+    if tmass is not None and not tmass.empty:
+        tmass = tmass.copy()
+        default_factor = catalog_params['2MASS']['factor']
+        default_min_radius = catalog_params['2MASS']['min_radius']
+        tmass['match_factor'] = default_factor
+        tmass['match_min_radius'] = default_min_radius
+        q_series = pd.Series('', index=tmass.index, dtype=object)
+        for col in ('Qflg', 'qflg', 'ph_qual'):
+            if col in tmass.columns:
+                q_series = tmass[col].astype(str).str.upper()
+                break
+        q_short = q_series.str.slice(0, 3)
+        has_A = q_short.str.contains('A', na=False)
+        bad_quality = ~has_A
+        special_mask = bad_quality
+        if special_mask.any():
+            tmass.loc[special_mask, 'match_factor'] = 3.5
+            tmass.loc[special_mask, 'match_min_radius'] = 0.5
 
     print("Querying WISE ...")
     wise = query_wise(center, radius)
@@ -5870,11 +5960,59 @@ def main() -> None:
                 val = entry
             if val is not None:
                 delete_ids.add(str(val))
+
+        def _row_match_params(row: pd.Series) -> tuple[float, float]:
+            try:
+                rf = float(row.get('match_factor', params['factor']))
+            except Exception:
+                rf = float(params['factor'])
+            try:
+                rm = float(row.get('match_min_radius', params['min_radius']))
+            except Exception:
+                rm = float(params['min_radius'])
+            return rf, rm
+
+        def _row_match_params(row: pd.Series) -> tuple[float, float]:
+            try:
+                rf = float(row.get('match_factor', params['factor']))
+            except Exception:
+                rf = float(params['factor'])
+            try:
+                rm = float(row.get('match_min_radius', params['min_radius']))
+            except Exception:
+                rm = float(params['min_radius'])
+            return rf, rm
+
+        def _row_match_params(row: pd.Series) -> tuple[float, float]:
+            try:
+                rf = float(row.get('match_factor', params['factor']))
+            except Exception:
+                rf = float(params['factor'])
+            try:
+                rm = float(row.get('match_min_radius', params['min_radius']))
+            except Exception:
+                rm = float(params['min_radius'])
+            return rf, rm
         # Always include RA and Dec in each catalog
         cols: list[str] = ['ra_deg', 'dec_deg']
         for ellipse in ['errMaj', 'errMin', 'errPA']:
             if ellipse in df_other.columns:
                 cols.append(ellipse)
+        for extra_col in ('match_factor', 'match_min_radius'):
+            if extra_col in df_other.columns and extra_col not in cols:
+                cols.append(extra_col)
+        for extra_col in ('match_factor', 'match_min_radius'):
+            if extra_col in df_other.columns and extra_col not in cols:
+                cols.append(extra_col)
+        for extra_col in ('match_factor', 'match_min_radius'):
+            if extra_col in df_other.columns and extra_col not in cols:
+                cols.append(extra_col)
+        for extra_col in ('match_factor', 'match_min_radius'):
+            if extra_col in df_other.columns and extra_col not in cols:
+                cols.append(extra_col)
+        for extra_col in ('match_factor', 'match_min_radius'):
+            if extra_col in df_other.columns and extra_col not in cols:
+                cols.append(extra_col)
         catalogs[key] = {
             'data': df_other.set_index(id_col)[cols],
             'frame': df_other.copy(),
@@ -5966,10 +6104,11 @@ def main() -> None:
                 # Skip this match if we cannot retrieve the source row
                 continue
             # Scale other ellipse and enforce minimum radius
-            scaled_maj = max(other_row['errMaj'] * params['factor'],
-                             params['min_radius'])
-            scaled_min = max(other_row['errMin'] * params['factor'],
-                             params['min_radius'])
+            row_factor, row_min_radius = _row_match_params(other_row)
+            scaled_maj = max(other_row['errMaj'] * row_factor,
+                             row_min_radius)
+            scaled_min = max(other_row['errMin'] * row_factor,
+                             row_min_radius)
             scaled_pa  = other_row['errPA']
             # Choose smaller AREA ellipse between current master and matched catalog
             try:
@@ -5995,10 +6134,11 @@ def main() -> None:
                     # Skip if not found in the catalog index
                     continue
                 # Scale other ellipse and enforce minimum radius
-                scaled_maj = max(other_row['errMaj'] * params['factor'],
-                                 params['min_radius'])
-                scaled_min = max(other_row['errMin'] * params['factor'],
-                                 params['min_radius'])
+                row_factor_extra, row_min_radius_extra = _row_match_params(other_row)
+                scaled_maj = max(other_row['errMaj'] * row_factor_extra,
+                                 row_min_radius_extra)
+                scaled_min = max(other_row['errMin'] * row_factor_extra,
+                                 row_min_radius_extra)
                 scaled_pa  = other_row['errPA']
                 # Determine which ellipse to use by area
                 try:
@@ -6051,10 +6191,11 @@ def main() -> None:
                 if str(other_row[id_col]) in deleted_ids:
                     continue
                 # Scale ellipse and enforce minimum radius
-                maj   = max(other_row['errMaj'] * params['factor'],
-                            params['min_radius'])
-                min_  = max(other_row['errMin'] * params['factor'],
-                            params['min_radius'])
+                row_factor_rev, row_min_radius_rev = _row_match_params(other_row)
+                maj   = max(other_row['errMaj'] * row_factor_rev,
+                            row_min_radius_rev)
+                min_  = max(other_row['errMin'] * row_factor_rev,
+                            row_min_radius_rev)
                 pa    = other_row['errPA']
                 entry = {
                     'ra_deg': other_row['ra_deg'],
@@ -6212,6 +6353,24 @@ def build_data_for_web(refresh: bool = False,
     if (include_set is None) or ('2mass' in include_set or '2mass_j' in include_set or '2mass-j' in include_set or '2MASS' in (include_catalogs if include_catalogs else [])):
         tmass = query_2mass(center, radius)
         tmass = filter_2mass_quality(tmass)
+        if tmass is not None and not tmass.empty:
+            tmass = tmass.copy()
+            default_factor = catalog_params['2MASS']['factor']
+            default_min_radius = catalog_params['2MASS']['min_radius']
+            tmass['match_factor'] = default_factor
+            tmass['match_min_radius'] = default_min_radius
+            q_series = pd.Series('', index=tmass.index, dtype=object)
+            for col in ('Qflg', 'qflg', 'ph_qual'):
+                if col in tmass.columns:
+                    q_series = tmass[col].astype(str).str.upper()
+                    break
+            q_short = q_series.str.slice(0, 3)
+            has_A = q_short.str.contains('A', na=False)
+            bad_quality = ~has_A
+            special_mask = bad_quality
+            if special_mask.any():
+                tmass.loc[special_mask, 'match_factor'] = 3.5
+                tmass.loc[special_mask, 'match_min_radius'] = 0.5
     if (include_set is None) or ('wise' in include_set):
         wise = query_wise(center, radius)
         wise = filter_wise_quality(wise)
@@ -6262,6 +6421,16 @@ def build_data_for_web(refresh: bool = False,
                 val = entry
             if val is not None:
                 delete_ids.add(str(val))
+        def _row_match_params(row: pd.Series) -> tuple[float, float]:
+            try:
+                rf = float(row.get('match_factor', params['factor']))
+            except Exception:
+                rf = float(params['factor'])
+            try:
+                rm = float(row.get('match_min_radius', params['min_radius']))
+            except Exception:
+                rm = float(params['min_radius'])
+            return rf, rm
         cols: list[str] = ['ra_deg', 'dec_deg']
         for ellipse in ['errMaj', 'errMin', 'errPA']:
             if ellipse in df_other.columns:
@@ -6322,8 +6491,9 @@ def build_data_for_web(refresh: bool = False,
             if other_row is None:
                 print(f"[web] warn: couldn't resolve {id_col} id {first_oid!r} in catalog index; skipping")
                 continue
-            scaled_maj = max(other_row['errMaj'] * params['factor'], params['min_radius'])
-            scaled_min = max(other_row['errMin'] * params['factor'], params['min_radius'])
+            row_factor, row_min_radius = _row_match_params(other_row)
+            scaled_maj = max(other_row['errMaj'] * row_factor, row_min_radius)
+            scaled_min = max(other_row['errMin'] * row_factor, row_min_radius)
             scaled_pa  = other_row['errPA']
             if scaled_maj < combined_df.at[i, 'errMaj']:
                 combined_df.at[i, 'ra_deg'] = other_row['ra_deg']
@@ -6343,8 +6513,9 @@ def build_data_for_web(refresh: bool = False,
                 if other_row is None:
                     print(f"[web] warn: couldn't resolve {id_col} id {lookup_key!r} in catalog index; skipping extra match")
                     continue
-                scaled_maj = max(other_row['errMaj'] * params['factor'], params['min_radius'])
-                scaled_min = max(other_row['errMin'] * params['factor'], params['min_radius'])
+                row_factor_extra, row_min_radius_extra = _row_match_params(other_row)
+                scaled_maj = max(other_row['errMaj'] * row_factor_extra, row_min_radius_extra)
+                scaled_min = max(other_row['errMin'] * row_factor_extra, row_min_radius_extra)
                 scaled_pa  = other_row['errPA']
                 entry = {
                     'ra_deg': other_row['ra_deg'],
@@ -6379,8 +6550,9 @@ def build_data_for_web(refresh: bool = False,
                 other_row = df_other.iloc[j]
                 if str(other_row[id_col]) in delete_ids:
                     continue
-                maj = max(other_row['errMaj'] * params['factor'], params['min_radius'])
-                min_ = max(other_row['errMin'] * params['factor'], params['min_radius'])
+                row_factor_rev, row_min_radius_rev = _row_match_params(other_row)
+                maj = max(other_row['errMaj'] * row_factor_rev, row_min_radius_rev)
+                min_ = max(other_row['errMin'] * row_factor_rev, row_min_radius_rev)
                 pa = other_row['errPA']
                 entry = {
                     'ra_deg': other_row['ra_deg'],

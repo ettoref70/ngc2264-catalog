@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import socket
 from pathlib import Path
 from typing import Dict
 
@@ -106,9 +107,9 @@ def create_app() -> Flask:
     app = Flask(__name__)
 
     try:
-        _prefetch_workers = max(1, int(os.environ.get('DYN_PREFETCH_WORKERS', '2')))
+        _prefetch_workers = max(1, int(os.environ.get('DYN_PREFETCH_WORKERS', '4')))
     except Exception:
-        _prefetch_workers = 2
+        _prefetch_workers = 4
     PREFETCH_EXEC = ThreadPoolExecutor(max_workers=_prefetch_workers)
     PREFETCH_LOCK = threading.Lock()
     PREFETCH_TASKS: set[tuple[str, int]] = set()
@@ -237,9 +238,60 @@ def create_app() -> Flask:
             }
         return combined_df, catalogs
 
-    def _schedule_prefetch(key: str, current_page: int, total_pages: int, draw_images: bool) -> None:
-        # Prefetching is disabled to keep page generation strictly on-demand.
-        return
+    def _schedule_prefetch(key: str,
+                           current_page: int,
+                           total_pages: int,
+                           draw_images: bool,
+                           *,
+                           target_page: int | None = None,
+                           force_draw: bool | None = None) -> None:
+        """Background-generate the next page so navigation feels snappier."""
+        if PREFETCH_EXEC is None:
+            return
+        next_page = target_page if target_page is not None else (current_page + 1)
+        if next_page > total_pages or next_page <= current_page:
+            return
+        prefetch_draw = force_draw if force_draw is not None else draw_images
+        task_id = (key, next_page, bool(prefetch_draw))
+        with PREFETCH_LOCK:
+            if task_id in PREFETCH_TASKS:
+                return
+            PREFETCH_TASKS.add(task_id)
+
+        def _prefetch() -> None:
+            try:
+                with app.app_context():
+                    # Bias toward fast generation: skip backgrounds during prefetch.
+                    try:
+                        _ensure_pages_for(key, next_page, draw_images=False, prefetch=False)
+                    except Exception:
+                        # Fall back to matching the caller's draw mode if no-image prefetch failed.
+                        try:
+                            _ensure_pages_for(key, next_page, draw_images=prefetch_draw, prefetch=False)
+                        except Exception:
+                            pass
+            finally:
+                with PREFETCH_LOCK:
+                    PREFETCH_TASKS.discard(task_id)
+
+        try:
+            PREFETCH_EXEC.submit(_prefetch)
+        except Exception:
+            with PREFETCH_LOCK:
+                PREFETCH_TASKS.discard(task_id)
+
+    def _img_param_to_flag(raw: str | None) -> bool | None:
+        """Normalize ?img= query values to tri-state draw mode."""
+        if raw is None:
+            return None
+        val = raw.strip().lower()
+        if not val:
+            return None
+        if val in ('1', 'true', 'yes', 'on'):
+            return True
+        if val in ('0', 'false', 'no', 'off', 'skip'):
+            return False
+        return None
 
     def _ensure_pages_for(key: str, page_num: int, *, draw_images: bool | None = None, prefetch: bool = True) -> None:
         # Respect existing PDF_DEBUG_D2 setting; default to '0' (overlay off)
@@ -387,9 +439,27 @@ def create_app() -> Flask:
     @app.get('/page/<key>/<int:page>')
     def page(key: str, page: int):
         # Ensure that static HTML pages exist for this catalog; then serve the requested page
-        want_img = request.args.get('img', '').lower() in ('1','true','yes','on')
+        img_flag = _img_param_to_flag(request.args.get('img'))
         _set_debug_mode_from_request(request)
-        _ensure_pages_for(key, page, draw_images=want_img or None)
+        _ensure_pages_for(key, page, draw_images=img_flag)
+        if (request.args.get('only', '').lower() == 'to_check'):
+            try:
+                index = _load_page_index(key)
+                problem_list = sorted(_to_check_set(index))
+                total_from_index = _index_total_pages(index)
+                if problem_list:
+                    next_candidates = [p for p in problem_list if p > page]
+                    target_prefetch = next_candidates[0] if next_candidates else problem_list[0]
+                    if target_prefetch and target_prefetch != page:
+                        total_hint = total_from_index if total_from_index > 0 else max(problem_list[-1], page)
+                        _schedule_prefetch(key,
+                                           page,
+                                           total_hint,
+                                           draw_images=True,
+                                           target_page=target_prefetch,
+                                           force_draw=True)
+            except Exception:
+                pass
         entry = DATA.get(key)
         radius_suffix = ''
         if isinstance(entry, dict):
@@ -399,8 +469,13 @@ def create_app() -> Flask:
         fpath = HTML_DIR / fname
         if not fpath.exists():
             abort(404)
-        # Redirect to the canonical static path so relative links resolve
-        return redirect(url_for('serve_generated', subpath=fname), code=302)
+        # Redirect to the canonical static path so relative links resolve, preserving useful query args
+        extra: dict[str, str] = {}
+        for arg_key in ('img', 'only', 'debug'):
+            arg_val = request.args.get(arg_key)
+            if arg_val:
+                extra[arg_key] = arg_val
+        return redirect(url_for('serve_generated', subpath=fname, **extra), code=302)
 
     # ---- Support for "show only to-check" page navigation ----
     def _load_page_index(key: str) -> dict:
@@ -527,12 +602,16 @@ def create_app() -> Flask:
         """
         direction = (request.args.get('dir') or 'next').lower()
         only = (request.args.get('only') or 'all').lower()
-        want_img = request.args.get('img', '')
+        img_arg = request.args.get('img')
+        img_flag = _img_param_to_flag(img_arg)
         debug = request.args.get('debug', '')
 
         # Touch current page so that *_index.json exists/updates for this catalog & radius
         try:
-            _ensure_pages_for(key, max(1, page), draw_images=(want_img.lower() in ('1','true','yes','on')) or None, prefetch=False)
+            draw_hint = img_flag
+            if only == 'to_check':
+                draw_hint = False
+            _ensure_pages_for(key, max(1, page), draw_images=draw_hint, prefetch=False)
         except Exception:
             pass
 
@@ -541,7 +620,12 @@ def create_app() -> Flask:
         if total <= 0:
             # Fallback: move by ±1 within [1, ...]
             target = max(1, page + (-1 if direction == 'prev' else 1))
-            return redirect(url_for('page', key=key, page=target, img=want_img, debug=debug), code=302)
+            params = {}
+            if img_arg:
+                params['img'] = img_arg
+            if debug:
+                params['debug'] = debug
+            return redirect(url_for('page', key=key, page=target, **params), code=302)
 
         if only == 'to_check':
             tset = sorted(_to_check_set(index))
@@ -561,7 +645,16 @@ def create_app() -> Flask:
             else:
                 target = (page + 1) if page < total else 1
 
-        return redirect(url_for('page', key=key, page=target, img=want_img, debug=debug), code=302)
+        if only == 'to_check':
+            img_arg = 'skip'
+        params = {}
+        if img_arg:
+            params['img'] = img_arg
+        if debug:
+            params['debug'] = debug
+        if only == 'to_check':
+            params['only'] = 'to_check'
+        return redirect(url_for('page', key=key, page=target, **params), code=302)
 
     # Serve generated assets under /aladin_scripts/html/...
     @app.get('/aladin_scripts/html/<path:subpath>')
@@ -576,7 +669,19 @@ def create_app() -> Flask:
             prefix_token = m.group(1)
             page_num = int(m.group(2))
             extension = m.group(3)
-            want_img = request.args.get('img', '').lower() in ('1','true','yes','on')
+            img_flag = _img_param_to_flag(request.args.get('img'))
+            if img_flag is None:
+                ref = request.referrer
+                if ref:
+                    try:
+                        from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
+                        parsed = _urlparse(ref)
+                        qs = _parse_qs(parsed.query or '')
+                        img_vals = qs.get('img') or qs.get('IMG')
+                        if img_vals:
+                            img_flag = _img_param_to_flag(img_vals[-1])
+                    except Exception:
+                        pass
             _set_debug_mode_from_request(request)
             refresh_env = os.environ.get('DYN_REFRESH', '0').lower() in ('1','true','yes')
             refresh_qs = request.args.get('refresh', '').lower() in ('1','true','yes','on')
@@ -593,36 +698,42 @@ def create_app() -> Flask:
                     pass
             entry = DATA.get(base_key)
             radius_suffix = ''
+            last_mode: bool | None = None
             if isinstance(entry, dict):
                 radius_suffix = entry.get('radius_suffix') or cm._radius_suffix(entry.get('radius_deg'))
                 entry['radius_suffix'] = radius_suffix
+                last_mode = entry.get('last_draw_images')
             expected_prefix = f"{base_key}{radius_suffix or ''}"
             target_name = f"{expected_prefix}_page{page_num}.{extension}"
             target_subpath = target_name
             fpath = HTML_DIR / target_subpath
 
             # Desired draw mode mirrors the page handler: explicit query overrides env.
-            # Note: want_img already set above, debug mode already set by earlier call
-            draw_expectation = want_img or None
+            # Note: debug mode already set by earlier call
+            draw_expectation = img_flag
             if draw_expectation is None:
-                draw_expectation = not (os.environ.get('DYN_NO_IMAGES', '0').lower() in ('1','true','yes','on'))
+                if last_mode is not None:
+                    draw_expectation = bool(last_mode)
+                else:
+                    draw_expectation = not (os.environ.get('DYN_NO_IMAGES', '0').lower() in ('1','true','yes','on'))
 
             needs_refresh = (not fpath.exists()) or refresh_env or refresh_qs
-            entry = DATA.get(base_key)
-            if isinstance(entry, dict):
-                last_mode = entry.get('last_draw_images')
-                if last_mode is not None and bool(last_mode) != bool(draw_expectation):
-                    needs_refresh = True
+            if (last_mode is not None) and (bool(last_mode) != bool(draw_expectation)):
+                needs_refresh = True
             if needs_refresh:
                 try:
-                    _ensure_pages_for(base_key, page_num, draw_images=want_img or None)
+                    _ensure_pages_for(base_key, page_num, draw_images=draw_expectation)
                 except Exception:
                     pass
                 fpath = HTML_DIR / target_subpath
 
             if target_subpath != subpath:
                 if _is_safe_path(HTML_DIR, fpath) and fpath.exists():
-                    return redirect(url_for('serve_generated', subpath=target_subpath), code=302)
+                    qs = request.query_string.decode('utf-8', 'ignore')
+                    target_url = url_for('serve_generated', subpath=target_subpath)
+                    if qs:
+                        target_url = f"{target_url}?{qs}"
+                    return redirect(target_url, code=302)
                 # fall through to final safety check
 
         if not _is_safe_path(HTML_DIR, fpath) or not fpath.exists():
@@ -991,8 +1102,8 @@ if __name__ == '__main__':
     # Simple CLI for host/port and radius (falls back to environment variables)
     import argparse
     parser = argparse.ArgumentParser(description='Dynamic NGC 2264 pages server')
-    parser.add_argument('--host', default=os.environ.get('HOST', '127.0.0.1'),
-                        help='Host/IP to bind (default from HOST env or 127.0.0.1)')
+    parser.add_argument('--host', default=os.environ.get('HOST', '0.0.0.0'),
+                        help='Host/IP to bind (default from HOST env or 0.0.0.0)')
     parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', '5050')),
                         help='Port to listen on (default from PORT env or 5050)')
     parser.add_argument('--radius-deg', type=float, default=None,
@@ -1064,5 +1175,17 @@ if __name__ == '__main__':
     # Only enable debug mode if explicitly requested
     debug_mode = os.environ.get('FLASK_DEBUG', '0') in ('1', 'true', 'yes')
 
-    print(f"[dyn] Serving dynamic pages at http://{host}:{port}/ (scripts={SCRIPTS_DIR}, debug={debug_mode})")
+    friendly_urls: list[str] = []
+    if host == '0.0.0.0':
+        friendly_urls.append(f"http://127.0.0.1:{port}/")
+        try:
+            lan_ip = socket.gethostbyname(socket.gethostname())
+            if lan_ip and not lan_ip.startswith('127.'):
+                friendly_urls.append(f"http://{lan_ip}:{port}/")
+        except Exception:
+            pass
+    else:
+        friendly_urls.append(f"http://{host}:{port}/")
+    url_hint = ', '.join(friendly_urls) if friendly_urls else f"http://{host}:{port}/"
+    print(f"[dyn] Serving dynamic pages at {url_hint} (bound={host}, scripts={SCRIPTS_DIR}, debug={debug_mode})")
     app.run(host=host, port=port, debug=debug_mode)

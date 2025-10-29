@@ -1,6 +1,9 @@
 tmp.py
+tmp_*
 catalogs
 ngc2264_combined.csv
 aladin_scripts
 edits
 *.pdf
+__pycache__/
+*.pyc
