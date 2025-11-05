@@ -26,7 +26,7 @@
 
   function _autoKey(){
     try{
-      var base = (typeof PAGE_KEY === 'string' && PAGE_KEY) ? PAGE_KEY : 'global';
+      var base = (typeof PAGE_PREFIX === 'string' && PAGE_PREFIX) ? PAGE_PREFIX : 'global';
       return 'AUTO_ALADIN_' + base;
     }catch(e){
       return 'AUTO_ALADIN_global';
@@ -151,7 +151,7 @@
       }
     }catch(e){}
     try{
-      if(typeof PAGE_KEY === 'string' && PAGE_KEY){
+      if(typeof PAGE_PREFIX === 'string' && PAGE_PREFIX){
         var current = Number(PAGE_NUM || 0);
         if(!Number.isFinite(current) || current < 1) current = 1;
         var total = _totalPages();
@@ -164,7 +164,7 @@
         if(target === current) return null;
         var a = document.createElement('a');
         var hash = '#seek=' + dir;
-        a.setAttribute('href', PAGE_KEY + '_page' + target + '.html' + hash);
+        a.setAttribute('href', PAGE_PREFIX + '_page' + target + '.html' + hash);
         return a;
       }
     }catch(e){}
@@ -236,7 +236,7 @@
     try{
       var onlyOn = (function(){
         try{
-          var key = 'ONLY_PROB_' + (PAGE_KEY || '');
+          var key = 'ONLY_PROB_' + (PAGE_PREFIX || '');
           return localStorage.getItem(key) === '1';
         }catch(e){ return false; }
       })();
@@ -257,7 +257,7 @@
         return false;
       }
       if(target !== current){
-        window.location.replace(PAGE_KEY + '_page' + target + '.html#seek=' + dir);
+        window.location.replace(PAGE_PREFIX + '_page' + target + '.html#seek=' + dir);
         return true;
       }
     }catch(e){}
@@ -371,7 +371,11 @@
         var currentL = Number(PAGE_NUM || 0);
         if(!Number.isFinite(currentL) || currentL < 1){ currentL = 1; }
         if(currentL > 1){
-          window.location.href = PAGE_KEY + '_page' + (currentL - 1) + '.html#seek=prev';
+          if(typeof _navToPage === 'function'){
+            _navToPage(currentL - 1, 'prev', {img:'1', replace:true});
+          } else {
+            window.location.href = PAGE_PREFIX + '_page' + (currentL - 1) + '.html#seek=prev';
+          }
         }
         return;
       }
@@ -388,7 +392,11 @@
         if(!Number.isFinite(currentR) || currentR < 1){ currentR = 1; }
         var totalPages = _totalPages();
         if(currentR < totalPages){
-          window.location.href = PAGE_KEY + '_page' + (currentR + 1) + '.html#seek=next';
+          if(typeof _navToPage === 'function'){
+            _navToPage(currentR + 1, 'next', {img:'1', replace:true});
+          } else {
+            window.location.href = PAGE_PREFIX + '_page' + (currentR + 1) + '.html#seek=next';
+          }
         }
         return;
       }

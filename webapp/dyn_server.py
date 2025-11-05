@@ -11,7 +11,6 @@ from flask import Flask, abort, redirect, render_template_string, request, send_
 import sys
 import math
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 # Configure logging
@@ -106,11 +105,7 @@ def _set_debug_mode_from_request(request) -> None:
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    try:
-        _prefetch_workers = max(1, int(os.environ.get('DYN_PREFETCH_WORKERS', '4')))
-    except Exception:
-        _prefetch_workers = 4
-    PREFETCH_EXEC = ThreadPoolExecutor(max_workers=_prefetch_workers)
+    PREFETCH_EXEC = None  # Prefetch disabled; avoid spinning background threads
     PREFETCH_LOCK = threading.Lock()
     PREFETCH_TASKS: set[tuple[str, int]] = set()
 
@@ -118,6 +113,17 @@ def create_app() -> Flask:
     # Each entry keeps the pre-edit baseline so we can reapply edits quickly.
     DATA: Dict[str, Dict[str, object]] = {}
     DATA_LOCK = threading.RLock()  # Reentrant lock for nested access
+
+    def _normalize_catalog_key(token: str) -> str:
+        """Strip radius/version suffix (e.g., '_r1', '_r1_311025') from catalog key."""
+        if not token:
+            return token
+        if '_r' not in token:
+            return token
+        head, tail = token.split('_r', 1)
+        if head and tail and tail[0].isdigit():
+            return head
+        return token
 
     def _try_build_from_combined(key: str):
         import pandas as _pd
@@ -209,10 +215,13 @@ def create_app() -> Flask:
         # Load edit links and pass to builder
         edits_path, edits = _load_edits_for_radius(_r_val)
 
-        # Get Chandra CSV path from environment (required)
+        # Get Chandra CSV path from environment (fall back to project default)
         chandra_csv = os.environ.get('CHANDRA_CSV_PATH')
         if not chandra_csv:
-            logger.warning("CHANDRA_CSV_PATH not set, Chandra catalog will be unavailable")
+            chandra_csv = "/Users/ettoref/ASTRONOMY/DATA/N2264_XMM_alt/N2264_acis12.csv"
+        if chandra_csv and not os.path.exists(chandra_csv):
+            logger.warning("Chandra CSV not found at %s; catalog will be skipped", chandra_csv)
+            chandra_csv = None
 
         combined_df, catalogs = cm.build_data_for_web(refresh=refresh,
                                                       chandra_csv_path=chandra_csv,
@@ -246,6 +255,7 @@ def create_app() -> Flask:
                            target_page: int | None = None,
                            force_draw: bool | None = None) -> None:
         """Background-generate the next page so navigation feels snappier."""
+        return  # Prefetch disabled per user request
         if PREFETCH_EXEC is None:
             return
         next_page = target_page if target_page is not None else (current_page + 1)
@@ -303,7 +313,6 @@ def create_app() -> Flask:
         if isinstance(entry, dict):
             radius_suffix = entry.get('radius_suffix') or cm._radius_suffix(entry.get('radius_deg'))
             entry['radius_suffix'] = radius_suffix
-        page_prefix = f"{key}{radius_suffix or ''}"
         if key not in catalogs:
             abort(404)
         # Normalize key for lookup when built from CSV
@@ -363,7 +372,6 @@ def create_app() -> Flask:
                 df_other,
                 id_col,
                 catalogs,
-                pdf_path=None,
                 plot_mode='match',
                 ncols=ncols,
                 nrows=nrows,
@@ -375,35 +383,6 @@ def create_app() -> Flask:
             )
             if prefetch:
                 _schedule_prefetch(key, page_num, total_pages, draw_images)
-            if radius_suffix:
-                try:
-                    import shutil
-                    base_prefix = key
-                    target_prefix = f"{key}{radius_suffix}"
-                    file_pairs = []
-                    base_html = HTML_DIR / f"{base_prefix}_page{page_num}.html"
-                    target_html = HTML_DIR / f"{target_prefix}_page{page_num}.html"
-                    if base_html.exists():
-                        file_pairs.append((base_html, target_html))
-                    for ext in ('jpg', 'png', 'webp'):
-                        base_img = HTML_DIR / f"{base_prefix}_page{page_num}.{ext}"
-                        target_img = HTML_DIR / f"{target_prefix}_page{page_num}.{ext}"
-                        if base_img.exists():
-                            file_pairs.append((base_img, target_img))
-                    base_index = HTML_DIR / f"{base_prefix}_index.json"
-                    target_index = HTML_DIR / f"{target_prefix}_index.json"
-                    if base_index.exists():
-                        file_pairs.append((base_index, target_index))
-                    for src_path, dest_path in file_pairs:
-                        try:
-                            if src_path.resolve() == dest_path.resolve():
-                                continue
-                        except Exception:
-                            pass
-                        dest_path.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src_path, dest_path)
-                except Exception:
-                    pass
         finally:
             try:
                 if prev_suffix_env is None:
@@ -439,27 +418,19 @@ def create_app() -> Flask:
     @app.get('/page/<key>/<int:page>')
     def page(key: str, page: int):
         # Ensure that static HTML pages exist for this catalog; then serve the requested page
-        img_flag = _img_param_to_flag(request.args.get('img'))
+        img_param = request.args.get('img')
+        requested_flag = _img_param_to_flag(img_param)
+        only_mode = (request.args.get('only', '').lower() == 'to_check')
         _set_debug_mode_from_request(request)
-        _ensure_pages_for(key, page, draw_images=img_flag)
-        if (request.args.get('only', '').lower() == 'to_check'):
-            try:
-                index = _load_page_index(key)
-                problem_list = sorted(_to_check_set(index))
-                total_from_index = _index_total_pages(index)
-                if problem_list:
-                    next_candidates = [p for p in problem_list if p > page]
-                    target_prefetch = next_candidates[0] if next_candidates else problem_list[0]
-                    if target_prefetch and target_prefetch != page:
-                        total_hint = total_from_index if total_from_index > 0 else max(problem_list[-1], page)
-                        _schedule_prefetch(key,
-                                           page,
-                                           total_hint,
-                                           draw_images=True,
-                                           target_page=target_prefetch,
-                                           force_draw=True)
-            except Exception:
-                pass
+        raw_key = key
+        key = _normalize_catalog_key(key)
+        draw_mode = True
+        if only_mode:
+            draw_mode = (img_param == '1')
+        elif requested_flag is not None:
+            draw_mode = bool(requested_flag)
+        logger.info(f"[page] render key={raw_key}→{key} page={page} only={only_mode} img_param={img_param} draw_images={draw_mode}")
+        _ensure_pages_for(key, page, draw_images=draw_mode)
         entry = DATA.get(key)
         radius_suffix = ''
         if isinstance(entry, dict):
@@ -471,10 +442,16 @@ def create_app() -> Flask:
             abort(404)
         # Redirect to the canonical static path so relative links resolve, preserving useful query args
         extra: dict[str, str] = {}
-        for arg_key in ('img', 'only', 'debug'):
-            arg_val = request.args.get(arg_key)
-            if arg_val:
-                extra[arg_key] = arg_val
+        if img_param:
+            extra['img'] = img_param
+        only_arg = request.args.get('only')
+        if only_mode:
+            extra['only'] = 'to_check'
+        elif only_arg:
+            extra['only'] = only_arg
+        debug_arg = request.args.get('debug')
+        if debug_arg:
+            extra['debug'] = debug_arg
         return redirect(url_for('serve_generated', subpath=fname, **extra), code=302)
 
     # ---- Support for "show only to-check" page navigation ----
@@ -563,7 +540,7 @@ def create_app() -> Flask:
         """
         pages = set()
         # direct lists
-        for k in ('to_check_pages', 'tocheck_pages', 'problematic_pages'):
+        for k in ('to_check_pages', 'tocheck_pages', 'problematic_pages', 'problem_pages'):
             try:
                 lst = index.get(k)
                 if isinstance(lst, list):
@@ -1058,10 +1035,14 @@ def create_app() -> Flask:
     def shutdown_executor(exception=None):
         """Cleanup resources when app context ends."""
         try:
-            PREFETCH_EXEC.shutdown(wait=False)
+            if PREFETCH_EXEC is not None:
+                PREFETCH_EXEC.shutdown(wait=False)
         except Exception as e:
             logger.error(f"Error shutting down executor: {e}")
 
+    # Expose helpers for programmatic consumers (e.g. cache_html_pages.py)
+    app.ensure_pages_for = _ensure_pages_for  # type: ignore[attr-defined]
+    app.load_data_for_key = _load_data_for_key  # type: ignore[attr-defined]
 
     @app.route('/api/key_debug', methods=['GET', 'POST'])
     def api_key_debug():
