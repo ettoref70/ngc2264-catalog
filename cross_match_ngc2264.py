@@ -1583,46 +1583,167 @@ def attach_2mass_blends(combined_df: pd.DataFrame,
         if tm_id in processed_ids:
             continue
         ra0 = float(tm['ra_deg']); dec0 = float(tm['dec_deg'])
+        jmag = None
+        try:
+            jmag = float(tm.get('Jmag'))
+        except Exception:
+            jmag = None
+        qflag = str(tm.get('Qflg', '')).strip().upper() if 'Qflg' in tmass_df.columns else ''
+        r_group_eff = float(r_group_arcsec)
+        pair_max_eff = float(max_pair_sep_arcsec)
+        centroid_eff = float(r_centroid_arcsec)
+        dG_eff = float(max_dG_mag)
+        is_bright = (jmag is not None) and np.isfinite(jmag) and (jmag <= 15.5)
+        if is_bright:
+            r_group_eff = max(r_group_eff, 3.5)
+            pair_max_eff = max(pair_max_eff, 4.0)
+            centroid_eff = max(centroid_eff, 1.4)
+            dG_eff = max(dG_eff, 4.2)
 
         # Geometry around this 2MASS source
         dx_as, dy_as = _deg_to_arcsec(gaia['ra'].values - ra0, gaia['dec'].values - dec0, dec0)
         sep_as = np.hypot(dx_as, dy_as)
-        cand = np.where(sep_as <= r_group_arcsec)[0]
+        cand = np.where(sep_as <= r_group_eff)[0]
+        if not is_bright:
+            cand_wide = np.where(sep_as <= 3.5)[0]
+            if len(cand_wide) >= 2:
+                max_sep_wide = float(np.max(sep_as[cand_wide]))
+                if max_sep_wide >= 1.8:
+                    r_group_eff = max(r_group_eff, min(3.5, max_sep_wide + 0.15))
+                    pair_max_eff = max(pair_max_eff, 4.0)
+                    centroid_eff = max(centroid_eff, 1.3)
+                    dG_eff = max(dG_eff, 3.0)
+                    cand = np.where(sep_as <= r_group_eff)[0]
         if len(cand) < 2:
             continue
-
-        # Pairwise compactness
-        ok_pairs = True
-        idxs = cand.tolist()
-        for i in range(len(idxs)):
-            for j in range(i + 1, len(idxs)):
-                a = gaia.iloc[idxs[i]]; b = gaia.iloc[idxs[j]]
-                dxa, dya = _deg_to_arcsec(float(a['ra'] - b['ra']), float(a['dec'] - b['dec']), dec0)
-                if np.hypot(dxa, dya) > max_pair_sep_arcsec:
-                    ok_pairs = False
-                    break
-            if not ok_pairs:
-                break
-        if not ok_pairs:
+        if np.count_nonzero(sep_as <= 3.0) < 2:
             continue
 
-        # Centroid proximity
-        ra_c = float(np.mean(gaia.iloc[idxs]['ra'].values))
-        dec_c = float(np.mean(gaia.iloc[idxs]['dec'].values))
-        dx_c_as, dy_c_as = _deg_to_arcsec(ra_c - ra0, dec_c - dec0, dec0)
-        if np.hypot(dx_c_as, dy_c_as) > r_centroid_arcsec:
+        def _check_group(idxs: list[int]) -> tuple[bool, dict[int, set[int]]]:
+            adjacency: dict[int, set[int]] = {idx: set() for idx in idxs}
+            for i in range(len(idxs)):
+                for j in range(i + 1, len(idxs)):
+                    a = gaia.iloc[idxs[i]]; b = gaia.iloc[idxs[j]]
+                    dxa, dya = _deg_to_arcsec(float(a['ra'] - b['ra']), float(a['dec'] - b['dec']), dec0)
+                    if np.hypot(dxa, dya) <= pair_max_eff:
+                        adjacency[idxs[i]].add(idxs[j])
+                        adjacency[idxs[j]].add(idxs[i])
+            if any(len(neigh) == 0 for neigh in adjacency.values()):
+                return False, adjacency
+            visited: set[int] = set()
+            stack = [idxs[0]]
+            while stack:
+                node = stack.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                stack.extend(adjacency[node] - visited)
+            if len(visited) != len(idxs):
+                return False, adjacency
+            return True, adjacency
+
+        idxs = cand.tolist()
+        idx_labels = gaia.index[idxs]
+        removed_labels: set[int] = set()
+        ok_group, adjacency = _check_group(idxs)
+        if (not ok_group) and (len(idxs) > 2):
+            farthest_pos = int(np.argmax(sep_as[idxs]))
+            label_remove = int(idx_labels[farthest_pos])
+            reduced = [idx for idx in idxs if idx != idxs[farthest_pos]]
+            ok_group, adjacency = _check_group(reduced)
+            if ok_group:
+                removed_labels.add(label_remove)
+                idxs = reduced
+                idx_labels = gaia.index[idxs]
+        if not ok_group:
+            continue
+
+        # Centroid proximity (with optional removal of farthest member to improve centroid)
+        while True:
+            ra_vals = gaia.iloc[idxs]['ra'].values.astype(float)
+            dec_vals = gaia.iloc[idxs]['dec'].values.astype(float)
+            gmag_vals = gaia.iloc[idxs]['Gmag'].values
+            with np.errstate(over='ignore', invalid='ignore'):
+                flux = np.power(10.0, -0.4 * gmag_vals)
+            flux = np.where(np.isfinite(flux), flux, 0.0)
+            if np.all(flux <= 0):
+                ra_c = float(np.mean(ra_vals))
+                dec_c = float(np.mean(dec_vals))
+            else:
+                ra_c = float(np.sum(ra_vals * flux) / np.sum(flux))
+                dec_c = float(np.sum(dec_vals * flux) / np.sum(flux))
+            dx_c_as, dy_c_as = _deg_to_arcsec(ra_c - ra0, dec_c - dec0, dec0)
+            centroid_offset = np.hypot(dx_c_as, dy_c_as)
+            if centroid_offset <= centroid_eff or len(idxs) <= 2:
+                break
+            improved = False
+            order = np.argsort(sep_as[idxs])[::-1]
+            for pos in order:
+                idx_remove = idxs[pos]
+                label_remove = int(idx_labels[pos])
+                reduced = [idx for idx in idxs if idx != idx_remove]
+                if len(reduced) < 2:
+                    continue
+                ok_group_r, adjacency_r = _check_group(reduced)
+                if not ok_group_r:
+                    continue
+                ra_vals_r = gaia.iloc[reduced]['ra'].values.astype(float)
+                dec_vals_r = gaia.iloc[reduced]['dec'].values.astype(float)
+                gmag_vals_r = gaia.iloc[reduced]['Gmag'].values
+                with np.errstate(over='ignore', invalid='ignore'):
+                    flux_r = np.power(10.0, -0.4 * gmag_vals_r)
+                flux_r = np.where(np.isfinite(flux_r), flux_r, 0.0)
+                if np.all(flux_r <= 0):
+                    ra_c_r = float(np.mean(ra_vals_r))
+                    dec_c_r = float(np.mean(dec_vals_r))
+                else:
+                    ra_c_r = float(np.sum(ra_vals_r * flux_r) / np.sum(flux_r))
+                    dec_c_r = float(np.sum(dec_vals_r * flux_r) / np.sum(flux_r))
+                dx_c_r, dy_c_r = _deg_to_arcsec(ra_c_r - ra0, dec_c_r - dec0, dec0)
+                centroid_r = np.hypot(dx_c_r, dy_c_r)
+                if centroid_r <= centroid_eff:
+                    idxs = reduced
+                    idx_labels = gaia.index[idxs]
+                    adjacency = adjacency_r
+                    removed_labels.add(label_remove)
+                    centroid_offset = centroid_r
+                    improved = True
+                    break
+            if not improved:
+                break
+        if centroid_offset > centroid_eff:
             continue
 
         # Brightness similarity (optional)
         gvals = gaia.iloc[idxs]['Gmag'].values
-        if np.nanmax(gvals) - np.nanmin(gvals) > max_dG_mag:
+        if np.nanmax(gvals) - np.nanmin(gvals) > dG_eff:
             continue
         # Require at least one candidate not already attached; otherwise nothing new to mark
         existing_idxs = tmass_grouped.get(tm_id, [])
-        new_attach = []
-        for idx_candidate in idxs:
-            gid = int(gaia.iloc[idx_candidate]['gaia_id'])
-            if not any(int(combined_df.iloc[i]['gaia_id']) == gid for i in existing_idxs):
+        new_attach: list[int] = []
+        gaia_ids_lookup = []
+        for label in idx_labels:
+            try:
+                gid_val = combined_df.iloc[int(label)].get('gaia_id', np.nan)
+            except Exception:
+                gid_val = np.nan
+            if pd.isna(gid_val):
+                gaia_ids_lookup.append(None)
+            else:
+                gaia_ids_lookup.append(int(gid_val))
+        for idx_candidate, gid in zip(idxs, gaia_ids_lookup):
+            if gid is None:
+                continue
+            already = False
+            for i in existing_idxs:
+                try:
+                    gid_existing = combined_df.iloc[i].get('gaia_id', np.nan)
+                except Exception:
+                    gid_existing = np.nan
+                if not pd.isna(gid_existing) and int(gid_existing) == gid:
+                    already = True
+                    break
+            if not already:
                 new_attach.append(idx_candidate)
         if not new_attach:
             continue
@@ -1638,7 +1759,19 @@ def attach_2mass_blends(combined_df: pd.DataFrame,
             pass
 
         # Attach to all Gaia members in the group
-        gaia_ids = [int(g) for g in gaia.iloc[idxs]['gaia_id'].values]
+        gaia_ids = []
+        for label, gid in zip(idx_labels, gaia_ids_lookup):
+            if gid is None:
+                continue
+            try:
+                lab_int = int(label)
+            except Exception:
+                lab_int = None
+            if (lab_int is not None) and (lab_int in removed_labels):
+                continue
+            gaia_ids.append(gid)
+        if not gaia_ids:
+            continue
         for gid in gaia_ids:
             mask = combined_df['gaia_id'] == gid
             combined_df.loc[mask, '2MASS'] = tm.get('2MASS')
@@ -2094,7 +2227,15 @@ def cross_match(source_df: pd.DataFrame,
                 except la.LinAlgError:
                     continue
             D2 = float(vec.dot(sol))
-            if D2 <= 1.0:
+            d2_limit = 1.0
+            if other_id_col.upper() == '2MASS':
+                sep_as = float(np.hypot(vec[0], vec[1]) * 3600.0)
+                maj_as = float(max(oth_maj[j], oth_min[j]) * 3600.0)
+                maj_as = max(maj_as, 1e-6)
+                ratio = sep_as / maj_as
+                if sep_as <= 0.35 and ratio <= 1.6:
+                    d2_limit = 1.8
+            if D2 <= d2_limit:
                 if other_id_col in other_df.columns:
                     ids.append(other_df.iloc[j][other_id_col])
                 else:
@@ -3410,8 +3551,15 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             b = max(b, master_floor_as)
                             return a * b
 
+                        def _sep_at(idx):
+                            try:
+                                dx, dy = _src_offset(idx)
+                                return float(np.hypot(dx, dy))
+                            except Exception:
+                                return float('inf')
+
                         try:
-                            used_master_idx = min(master_valid, key=_area_at)
+                            used_master_idx = min(master_valid, key=lambda idx: (_sep_at(idx), _area_at(idx)))
                         except Exception:
                             used_master_idx = master_valid[0]
                         m = used_master_idx
