@@ -351,8 +351,21 @@ def create_app() -> Flask:
         # Default to draw images unless explicitly disabled or overridden via arg
         if draw_images is None:
             draw_images = not (os.environ.get('DYN_NO_IMAGES', '0') in ('1', 'true', 'yes'))
+        def _normalized_image_ext() -> str:
+            fmt = str(os.environ.get('HTML_IMAGE_FORMAT', 'jpg')).strip().lower()
+            if fmt in ('jpg', 'jpeg'):
+                return 'jpg'
+            if fmt == 'webp':
+                return 'webp'
+            return 'png'
+
         per_page = max(1, ncols * nrows)
         total_pages = max(1, math.ceil(len(df_other) / per_page))
+        page_prefix = f"{key}{radius_suffix or ''}"
+        html_target = HTML_DIR / f"{page_prefix}_page{page_num}.html"
+        if draw_images is False and html_target.exists():
+            logger.info(f"[ensure] skip regeneration for {page_prefix} page {page_num} (img=skip, html cached)")
+            return
         # Generate only the requested page for this catalog (writes to aladin_scripts/html)
         # Use env var understood by the plotter to limit generation to a single page
         os.environ['ALADIN_PAGE_ONLY'] = str(int(page_num))

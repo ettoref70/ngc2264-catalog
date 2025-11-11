@@ -117,7 +117,7 @@ import argparse
 
 # -------------------- Edit-link helpers --------------------
 CURRENT_EDITS_RADIUS: float | None = None
-NAV_KEYS_VERSION = "20251029j"
+NAV_KEYS_VERSION = "20251106a"
 
 NAV_KEYS_TEMPLATE_PATH = Path(__file__).resolve().parent / 'aladin_scripts' / 'html' / 'nav_keys.js'
 NAV_KEYS_MINIMAL = (
@@ -410,6 +410,10 @@ def _load_nav_keys_template() -> str:
 
 
 NAV_JS_TEMPLATE = _load_nav_keys_template()
+
+HTML_IMG_PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='
+STRICT_REVIEW_DELTA_G_MAG = 4.0  # magnitudes
+STRICT_REVIEW_CLEAN_D2 = 1.25
 
 # -------------------- Blend detection constants --------------------
 # Thresholds for identifying 2MASS blends (multiple Gaia sources in unresolved 2MASS source)
@@ -4384,6 +4388,66 @@ def plot_after_merge(combined_df: pd.DataFrame,
             close_count = 0
             close_unmatched = 0
             close_unmatched_any = 0
+            has_gmag_col = 'Gmag' in combined_df.columns
+            strict_delta_flag = False
+            strict_ref_g = None
+            strict_shadow_flag = False
+            gaia_other_cache: dict[int, bool] = {}
+
+            def _gmag_at(idx):
+                if not has_gmag_col:
+                    return None
+                try:
+                    val = float(combined_df.iloc[int(idx)].get('Gmag', np.nan))
+                except Exception:
+                    return None
+                if not np.isfinite(val):
+                    return None
+                return val
+
+            if has_gmag_col:
+                if used_master_idx is not None:
+                    strict_ref_g = _gmag_at(used_master_idx)
+                if (strict_ref_g is None) and master_indices:
+                    for _m_ref in master_indices:
+                        strict_ref_g = _gmag_at(_m_ref)
+                        if strict_ref_g is not None:
+                            break
+
+            def _delta_g_exceeds(idx):
+                if strict_ref_g is None:
+                    return False
+                g_val = _gmag_at(idx)
+                if g_val is None:
+                    return False
+                return abs(g_val - strict_ref_g) > STRICT_REVIEW_DELTA_G_MAG
+
+            def _gaia_has_other_match(gid_val):
+                try:
+                    gid_int = int(gid_val)
+                except Exception:
+                    return False
+                if gid_int in gaia_other_cache:
+                    return gaia_other_cache[gid_int]
+                try:
+                    mask_gid = combined_df['gaia_id'] == gid_int
+                except Exception:
+                    gaia_other_cache[gid_int] = False
+                    return False
+                has_other = False
+                try:
+                    subset = combined_df.loc[mask_gid, id_col] if mask_gid.any() else []
+                    for other_val in subset:
+                        if _is_missing(other_val):
+                            continue
+                        if str(other_val) != str(new_id):
+                            has_other = True
+                            break
+                except Exception:
+                    has_other = False
+                gaia_other_cache[gid_int] = has_other
+                return has_other
+
             try:
                 if master_indices:
                     for _m in master_indices:
@@ -4404,8 +4468,17 @@ def plot_after_merge(combined_df: pd.DataFrame,
                                 id_val = combined_df.iloc[_m].get(id_col, None) if id_col in combined_df.columns else None
                                 if _is_missing(id_val):
                                     close_unmatched += 1
+                                    if (not strict_delta_flag) and _delta_g_exceeds(_m):
+                                        strict_delta_flag = True
                             except Exception:
                                 pass
+                            if (not strict_shadow_flag) and ('gaia_id' in combined_df.columns):
+                                try:
+                                    gid_candidate = combined_df.iloc[_m].get('gaia_id', None)
+                                    if (gid_candidate is not None) and (not pd.isna(gid_candidate)) and _gaia_has_other_match(gid_candidate):
+                                        strict_shadow_flag = True
+                                except Exception:
+                                    pass
             except Exception:
                 pass
             try:
@@ -4424,8 +4497,17 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             id_val = combined_df.iloc[_cand].get(id_col, None) if id_col in combined_df.columns else None
                             if _is_missing(id_val):
                                 close_unmatched_any += 1
+                                if (not strict_delta_flag) and _delta_g_exceeds(_cand):
+                                    strict_delta_flag = True
                         except Exception:
                             continue
+                        if (not strict_shadow_flag) and ('gaia_id' in combined_df.columns):
+                            try:
+                                gid_candidate = combined_df.iloc[_cand].get('gaia_id', None)
+                                if (gid_candidate is not None) and (not pd.isna(gid_candidate)) and _gaia_has_other_match(gid_candidate):
+                                    strict_shadow_flag = True
+                            except Exception:
+                                pass
             except Exception:
                 pass
             is_problem = False
@@ -5093,6 +5175,29 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     except Exception:
                         pass
 
+                    panel_has_match = 1 if num_valid_master > 0 else 0
+                    panel_is_blend = 0
+                    if key == '2MASS' and master_indices:
+                        try:
+                            gaia_seen = set()
+                            for _m in master_indices:
+                                try:
+                                    gid_val = combined_df.iloc[_m].get('gaia_id', None)
+                                except Exception:
+                                    continue
+                                if pd.isna(gid_val):
+                                    continue
+                                try:
+                                    gid_int = int(gid_val)
+                                except Exception:
+                                    continue
+                                if gid_int == -1:
+                                    continue
+                                gaia_seen.add(gid_int)
+                            if len(gaia_seen) >= 2:
+                                panel_is_blend = 1
+                        except Exception:
+                            panel_is_blend = 0
                     # Save area info for page-level HTML image map
                     try:
                         page_areas.append({
@@ -5101,6 +5206,11 @@ def plot_after_merge(combined_df: pd.DataFrame,
                             'aladin': file_url,
                             'lite': url,
                             'problem': 1 if is_problem else 0,
+                            'has_match': panel_has_match,
+                            'blend': panel_is_blend,
+                            'strict_faint': 1 if strict_delta_flag else 0,
+                            'strict_clean': 1 if (num_valid_master == 1 and (best_d2 is not None) and np.isfinite(best_d2) and (best_d2 < STRICT_REVIEW_CLEAN_D2)) else 0,
+                            'strict_shadow': 1 if strict_shadow_flag else 0,
                         })
                     except Exception:
                         pass
@@ -5474,6 +5584,11 @@ def plot_after_merge(combined_df: pd.DataFrame,
                         'coords': panel_rect,
                         'href': '',
                         'problem': int(area.get('problem', 0)),
+                        'has_match': int(area.get('has_match', 0)),
+                        'blend': int(area.get('blend', 0)),
+                        'strict_faint': int(area.get('strict_faint', 0)),
+                        'strict_clean': int(area.get('strict_clean', 0)),
+                        'strict_shadow': int(area.get('strict_shadow', 0)),
                     })
                 except Exception:
                     pass
@@ -5508,6 +5623,12 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 '.kbdbar kbd{background:#f3f3f3;border:1px solid rgba(0,0,0,.18);border-radius:4px;padding:2px 6px;'
                 'font-size:12px;font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace;'
                 'box-shadow:inset 0 -1px 0 rgba(0,0,0,.08)}'
+                '.mode-slider{display:inline-flex;align-items:center;gap:6px;font:13px -apple-system,BlinkMacSystemFont,Segoe UI,Arial;}'
+                '.mode-slider label{font-weight:600;margin-right:2px;}'
+                '.mode-slider input[type=range]{width:72px;cursor:pointer;}'
+                '.mode-slider .mode-tags{display:inline-flex;gap:4px;font-size:12px;color:#666;}'
+                '.mode-slider .mode-tags span{padding:0 4px;border-radius:4px;background:#f3f3f3;}'
+                '.mode-slider .mode-tags span.active{background:#333;color:#fff;}'
                 '</style>',
                 # Navigation links
                 '<div class="nav">'
@@ -5525,7 +5646,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     f'<a href="{next_name}" onclick="_navToPage({page_num+1}, \\"next\\"); return false;">Next Page »</a>'
                 )
             # Filter toggle controls
-            lines.append(' | <label><input type="checkbox" id="only_prob"> Skip easy matches</label>')
+            lines.append(' | <span class="mode-slider" title="Review focus"><label for="review_mode">Review</label> '
+                         '<input type="range" id="review_mode" min="0" max="2" step="1" value="0"> '
+                         '<span class="mode-tags"><span data-mode="0">All</span><span data-mode="1">Focus</span><span data-mode="2">Strict</span></span></span>')
             lines.append(f' | <label><input type="checkbox" id="show_debug"{debug_attr}> Show D² debug</label>')
             lines.append(' | <label><input type="checkbox" id="auto_aladin"> Auto Aladin</label>')
             # Top-right link to go back one level (master index). Default points to static index
@@ -5544,7 +5667,11 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 '</div>',
                 # hidden sink frame so link navigations don't replace the page
                 '<iframe name="aladin_sink" width="0" height="0" style="display:none;border:0;position:absolute;left:-9999px;"></iframe>',
-                f'<div class="wrap"><img src="{png_name}" alt="">'
+                (
+                    f'<div class="wrap"><img class="page-bg" data-bg-src="{png_name}" '
+                    f'src="{HTML_IMG_PLACEHOLDER}" alt="" width="{disp_w}" height="{disp_h}" '
+                    'loading="lazy" decoding="async">'
+                )
             ]
             # Overlay anchors
             aladin_items_js = []
@@ -5576,11 +5703,17 @@ def plot_after_merge(combined_df: pd.DataFrame,
                     # Add panel overlay container with skip checkbox and mask for filtering
                     base_id = a.get('base', '')
                     prob = int(a.get('problem', 0))
+                    match_attr = '1' if int(a.get('has_match', 0)) else '0'
+                    blend_attr = '1' if int(a.get('blend', 0)) else '0'
+                    strict_attr = '1' if int(a.get('strict_faint', 0)) else '0'
+                    clean_attr = '1' if int(a.get('strict_clean', 0)) else '0'
+                    shadow_attr = '1' if int(a.get('strict_shadow', 0)) else '0'
                     other_attr = escape(str(new_id))
                     cat_attr = escape(str(key))
                     del_attr = '1' if is_deleted else '0'
                     lines.append(
                         f'<div class="panelbox" data-base="{base_id}" data-problem="{prob}" data-cat="{cat_attr}" data-other="{other_attr}" data-deleted="{del_attr}" '
+                        f'data-has-match="{match_attr}" data-blend="{blend_attr}" data-strict-faint="{strict_attr}" data-strict-clean="{clean_attr}" data-strict-shadow="{shadow_attr}" '
                         f'style="position:absolute;left:{lp:.3f}%;top:{tp:.3f}%;width:{wp:.3f}%;height:{hp:.3f}%;z-index:8;">'
                         f'<button type="button" class="delbtn" onclick="return deleteSource(this);">Delete</button>'
                         f'<input type="checkbox" class="skipbox" data-base="{base_id}" title="Skip" '
@@ -5759,15 +5892,18 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 'function deleteSource(btn){ try{ const panel=btn.closest(".panelbox"); if(!panel) return false; const cat=panel.getAttribute("data-cat"); const other=panel.getAttribute("data-other"); if(!cat||!other) return false; if(!(window.confirm("Remove this source from the master catalog?"))){ return false; } btn.disabled=true; fetch("/api/delete_source",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cat:cat,id:other,page:PAGE_NUM})}).then(function(resp){ if(!resp.ok){ throw new Error(resp.status); } return resp.json().catch(function(){ return {ok:true}; }); }).then(function(payload){ if(payload && payload.ok){ location.reload(); } else { btn.disabled=false; alert((payload && payload.error) || "Delete failed."); } }).catch(function(err){ btn.disabled=false; alert("Delete failed: "+err); }); }catch(e){ alert("Delete failed."); } return false; }\n'
                 'function _readSkip(){ try{ const k = "SKIP_"+PAGE_KEY; const s = localStorage.getItem(k); return s? JSON.parse(s) : {}; }catch(e){ return {}; } }\n'
                 'function _writeSkip(obj){ try{ const k = "SKIP_"+PAGE_KEY; localStorage.setItem(k, JSON.stringify(obj)); }catch(e){} }\n'
-                'function _readOnly(){ try{ const k = "ONLY_PROB_"+PAGE_KEY; return localStorage.getItem(k)==='+'"1"'+'; }catch(e){ return false; } }\n'
-                'function _writeOnly(v){ try{ const k = "ONLY_PROB_"+PAGE_KEY; localStorage.setItem(k, v?"1":"0"); }catch(e){} }\n'
+                'function _clampReviewMode(v){ try{ v = parseInt(v,10); }catch(e){ v = 0; } if(isNaN(v) || v < 0) return 0; if(v > 2) return 2; return v; }\n'
+                'function _readReviewMode(){ try{ const k = "REVIEW_MODE_"+PAGE_KEY; const raw = localStorage.getItem(k); if(raw !== null){ return _clampReviewMode(raw); } }catch(e){} try{ const params = new URLSearchParams(window.location.search||""); const qp = params.get("review"); if(qp !== null){ return _clampReviewMode(qp); } if(params.get("only")==="to_check"){ return 1; } }catch(e){} return 0; }\n'
+                'function _writeReviewMode(v){ try{ const k = "REVIEW_MODE_"+PAGE_KEY; localStorage.setItem(k, String(_clampReviewMode(v))); }catch(e){} }\n'
+                'function _applyReviewLabels(val){ try{ const tags = document.querySelectorAll(".mode-slider .mode-tags span"); tags.forEach(function(tag){ if(String(tag.getAttribute("data-mode")) === String(val)){ tag.classList.add("active"); } else { tag.classList.remove("active"); } }); }catch(e){} }\n'
+                'function _panelNeedsReview(panel, mode){ try{ const skip = panel.getAttribute("data-skip")==="1"; if(skip){ return false; } if(mode <= 0){ return true; } const prob = panel.getAttribute("data-problem")==="1"; const isBlend = panel.getAttribute("data-blend")==="1"; const faint = panel.getAttribute("data-strict-faint")==="1"; const clean = panel.getAttribute("data-strict-clean")==="1"; const shadow = panel.getAttribute("data-strict-shadow")==="1"; if(mode === 1){ return prob; } if(clean || shadow){ return false; } return prob && !isBlend && !faint; }catch(e){} return false; }\n'
                 'function toggleSkip(cb){ try{ const base = cb.getAttribute("data-base"); if(!base) return false; const sk=_readSkip(); if(cb.checked){ sk[base]=1; } else { delete sk[base]; } _writeSkip(sk); const pb = cb.closest(".panelbox"); if(pb){ pb.setAttribute("data-skip", cb.checked?"1":"0"); } updatePanels(); }catch(e){} return true; }\n'
-                'function updatePanels(){ try{ const only = document.getElementById("only_prob"); const onlyOn = !!(only && only.checked); const pb = document.querySelectorAll(".panelbox"); pb.forEach(function(p){ const prob = p.getAttribute("data-problem")==="1"; const skip = p.getAttribute("data-skip")==="1"; const mask = p.querySelector(".mask"); let show = true; if(onlyOn){ show = prob && !skip; } else { show = !skip; } if(mask){ mask.style.display = show? "none" : "block"; } }); }catch(e){} return false; }\n'
-                'function _hasUnskippedProblems(){ try{ const pb = document.querySelectorAll(".panelbox"); for(let i=0;i<pb.length;i++){ const p=pb[i]; if(p.getAttribute("data-problem")==="1" && p.getAttribute("data-skip")!=="1"){ return true; } } }catch(e){} return false; }\n'
+                'function updatePanels(){ try{ const slider = document.getElementById("review_mode"); let mode = slider ? _clampReviewMode(slider.value) : 0; _applyReviewLabels(mode); const pb = document.querySelectorAll(".panelbox"); pb.forEach(function(p){ const show = _panelNeedsReview(p, mode); const mask = p.querySelector(".mask"); if(mask){ mask.style.display = show? "none" : "block"; } }); }catch(e){} return false; }\n'
+                'function _hasUnskippedProblems(){ try{ let mode = 0; if(typeof _currentReviewMode === "function"){ mode = _currentReviewMode(); } else { mode = _readReviewMode(); } const pb = document.querySelectorAll(".panelbox"); for(let i=0;i<pb.length;i++){ if(_panelNeedsReview(pb[i], mode)){ return true; } } }catch(e){} return false; }\n'
                 'function _getSeek(){ try{ const h=String(location.hash||""); const m=h.match(/seek=(next|prev)/); return m? m[1] : "next"; }catch(e){ return "next"; } }\n'
-                'function _navToPage(n, dir, opts){ if(typeof TOTAL_PAGES!=="number") return; if(n<1||n>TOTAL_PAGES) return; const prefix = (typeof window.PAGE_PREFIX==="string" && window.PAGE_PREFIX) ? window.PAGE_PREFIX : PAGE_PREFIX; try{ const auto = document.getElementById("auto_aladin"); const onlyBox = document.getElementById("only_prob"); if(auto && onlyBox && auto.checked && onlyBox.checked){ sessionStorage.setItem("AUTO_ALADIN_SUPPRESS","1"); } }catch(e){} let params; try{ params = new URLSearchParams(window.location.search||""); }catch(e){ params = null; } if(!params){ params = new URLSearchParams(); } let onlyOn = false; try{ const box = document.getElementById("only_prob"); onlyOn = !!(box && box.checked); }catch(e){} if(!onlyOn){ try{ onlyOn = (params.get("only") === "to_check"); }catch(e){} } if(onlyOn){ params.set("only","to_check"); } else { params.delete("only"); } let mode = null; if(opts && Object.prototype.hasOwnProperty.call(opts,"img")){ mode = opts.img; } else if(onlyOn){ mode = "1"; } if(mode === undefined || mode === null){ params.delete("img"); } else { const norm = String(mode).toLowerCase(); if(norm === "skip"){ params.set("img","skip"); } else if(norm === "1" || norm === "true"){ params.set("img","1"); } else { params.set("img", String(mode)); } } if(opts && Object.prototype.hasOwnProperty.call(opts,"bg")){ if(opts.bg === null){ params.delete("bg"); } else { params.set("bg", String(opts.bg)); } } else { params.delete("bg"); } if(opts && Object.prototype.hasOwnProperty.call(opts,"debug")){ params.set("debug", opts.debug ? "1" : "0"); } const query = params.toString(); let href = prefix + "_page" + n + ".html"; if(query){ href += "?" + query; } href += "#seek=" + (dir||"next"); if(opts && opts.replace){ window.location.replace(href); } else { window.location.href = href; } }\n'
+                'function _navToPage(n, dir, opts){ if(typeof TOTAL_PAGES!=="number") return; if(n<1||n>TOTAL_PAGES) return; const prefix = (typeof window.PAGE_PREFIX==="string" && window.PAGE_PREFIX) ? window.PAGE_PREFIX : PAGE_PREFIX; let reviewMode = 0; try{ if(typeof _currentReviewMode === "function"){ reviewMode = _currentReviewMode(); } else { const slider = document.getElementById("review_mode"); if(slider){ reviewMode = _clampReviewMode(slider.value); } } }catch(e){} try{ const auto = document.getElementById("auto_aladin"); if(auto && auto.checked && reviewMode >= 1){ sessionStorage.setItem("AUTO_ALADIN_SUPPRESS","1"); } }catch(e){} let params; try{ params = new URLSearchParams(window.location.search||""); }catch(e){ params = null; } if(!params){ params = new URLSearchParams(); } if(reviewMode <= 0){ try{ const qp = params.get("review"); if(qp !== null){ reviewMode = _clampReviewMode(qp); } else if(params.get("only") === "to_check"){ reviewMode = 1; } }catch(e){} } if(reviewMode >= 1){ params.set("only","to_check"); params.set("review", String(reviewMode)); } else { params.delete("only"); params.delete("review"); } let mode = null; if(opts && Object.prototype.hasOwnProperty.call(opts,"img")){ mode = opts.img; } if(mode === undefined || mode === null){ params.delete("img"); } else { const norm = String(mode).toLowerCase(); if(norm === "skip"){ params.set("img","skip"); } else if(norm === "1" || norm === "true"){ params.set("img","1"); } else { params.set("img", String(mode)); } } if(opts && Object.prototype.hasOwnProperty.call(opts,"bg")){ if(opts.bg === null){ params.delete("bg"); } else { params.set("bg", String(opts.bg)); } } else { params.delete("bg"); } if(opts && Object.prototype.hasOwnProperty.call(opts,"debug")){ params.set("debug", opts.debug ? "1" : "0"); } const query = params.toString(); let href = prefix + "_page" + n + ".html"; if(query){ href += "?" + query; } href += "#seek=" + (dir||"next"); if(opts && opts.replace){ window.location.replace(href); } else { window.location.href = href; } }\n'
                 'function _maybeAutoAdvance(){ try{ if(typeof maybeAutoAdvance === "function"){ return maybeAutoAdvance(window.PROBLEM_PAGES || []); } }catch(e){} return false; }\n'
-                'document.addEventListener("DOMContentLoaded", function(){ try{ const sk=_readSkip(); document.querySelectorAll(".panelbox").forEach(function(p){ const b=p.getAttribute("data-base"); if(sk[b]){ p.setAttribute("data-skip","1"); const cb=p.querySelector(".skipbox"); if(cb) cb.checked=true; } }); const only=document.getElementById("only_prob"); if(only){ only.checked = _readOnly(); only.addEventListener("change", function(){ _writeOnly(only.checked); updatePanels(); try{ var params = new URLSearchParams(window.location.search||""); if(only.checked){ params.set("only","to_check"); params.set("img","1"); } else { params.delete("only"); params.delete("img"); } var key = _resolvePageKey(); if(!key){ key = PAGE_KEY; } var href = key + "_page" + PAGE_NUM + ".html"; var query = params.toString(); if(query){ href += "?" + query; } var hash = window.location.hash || ""; window.location.replace(href + hash); }catch(e){} }); } updatePanels(); // tag Prev/Next anchors with seek\n'
+                'document.addEventListener("DOMContentLoaded", function(){ try{ const sk=_readSkip(); document.querySelectorAll(".panelbox").forEach(function(p){ const b=p.getAttribute("data-base"); if(sk[b]){ p.setAttribute("data-skip","1"); const cb=p.querySelector(".skipbox"); if(cb) cb.checked=true; } }); const slider=document.getElementById("review_mode"); let saved=_readReviewMode(); if(slider){ slider.value = saved; _applyReviewLabels(saved); slider.addEventListener("input", function(){ const val=_clampReviewMode(slider.value); slider.value = val; _applyReviewLabels(val); updatePanels(); }); slider.addEventListener("change", function(){ const next=_clampReviewMode(slider.value); slider.value = next; _writeReviewMode(next); updatePanels(); try{ var params = new URLSearchParams(window.location.search||""); if(next>=1){ params.set("only","to_check"); params.set("review", String(next)); } else { params.delete("only"); params.delete("review"); } var key = _resolvePageKey(); if(!key){ key = PAGE_KEY; } var href = key + "_page" + PAGE_NUM + ".html"; var query = params.toString(); if(query){ href += "?" + query; } var hash = window.location.hash || ""; window.location.replace(href + hash); }catch(e){} }); } else { _applyReviewLabels(saved); } updatePanels(); // tag Prev/Next anchors with seek\n'
                 '  document.querySelectorAll(".nav a").forEach(function(a){ const label=(a.textContent||"").toLowerCase(); if(label.indexOf("next page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=next"; } if(label.indexOf("prev page")!==-1 || label.indexOf("« prev page")!==-1){ if(a.href.indexOf("#seek=")===-1) a.href += "#seek=prev"; } a.addEventListener("click", function(ev){ try{ if(typeof _navToPage !== "function") return; const raw = a.getAttribute("href") || ""; const match = raw.match(/_page(\\d+)\\.html/); if(!match) return; ev.preventDefault(); const target = parseInt(match[1],10); const seek = (raw.indexOf("#seek=prev")!==-1 || label.indexOf("prev page")!==-1) ? "prev" : "next"; _navToPage(target, seek); }catch(err){} }); }); const dbg=document.getElementById("show_debug"); if(dbg){ dbg.addEventListener("change", function(){ try{ const on = !!dbg.checked; let rawKey = ""; try{ rawKey = (typeof window.PAGE_KEY === "string" && window.PAGE_KEY) ? window.PAGE_KEY : PAGE_KEY; }catch(err){ rawKey = PAGE_KEY; } let baseKey = rawKey; try{ const m = String(rawKey).match(/^(.*?)(_r\\d.*)?$/); if(m && m[1]){ baseKey = m[1]; } }catch(err){} if(!baseKey){ baseKey = rawKey || PAGE_KEY; } let target = "/page/" + baseKey + "/" + PAGE_NUM + "?debug=" + (on ? "1" : "0"); try{ if(window.location.search && window.location.search.indexOf("img=1") !== -1){ target += "&img=1"; } }catch(err){} const hash = window.location.hash || ""; if(hash && hash.indexOf("seek=") >= 0){ window.location.href = target + hash; } else { window.location.href = target; } }catch(err){ let fallbackTarget = "/page/" + PAGE_KEY + "/" + PAGE_NUM + "?debug=" + (dbg.checked ? "1" : "0"); try{ const rawKey = (typeof window.PAGE_KEY === "string" && window.PAGE_KEY) ? window.PAGE_KEY : PAGE_KEY; const m = String(rawKey).match(/^(.*?)(_r\\d.*)?$/); if(m && m[1]){ fallbackTarget = "/page/" + m[1] + "/" + PAGE_NUM + "?debug=" + (dbg.checked ? "1" : "0"); } }catch(inner){} window.location.href = fallbackTarget; } }); } }catch(e){} });\n'
                 '</script>'
             ]
@@ -5816,16 +5952,47 @@ def plot_after_merge(combined_df: pd.DataFrame,
 </script>''')
             lines.append('''<script>
 (function(){
-  function onlyModeOn(){
-    try{
-      var box = document.getElementById("only_prob");
-      if(box && box.checked) return true;
-    }catch(e){}
+  function _currentReviewMode(){
     try{
       var params = new URLSearchParams(window.location.search||"");
-      return params.get("only") === "to_check";
+      var qp = params.get("review");
+      if(qp !== null){
+        var val = parseInt(qp, 10);
+        if(!isNaN(val)){
+          if(val < 0) val = 0;
+          if(val > 2) val = 2;
+          return val;
+        }
+      }
+      if(params.get("only") === "to_check"){
+        return 1;
+      }
     }catch(e){}
-    return false;
+    try{
+      if(typeof _readReviewMode === "function"){
+        var stored = _readReviewMode();
+        if(!isNaN(stored)){
+          if(stored < 0) stored = 0;
+          if(stored > 2) stored = 2;
+          return stored;
+        }
+      }
+    }catch(e){}
+    try{
+      var slider = document.getElementById("review_mode");
+      if(slider){
+        var raw = parseInt(slider.value, 10);
+        if(!isNaN(raw)){
+          if(raw < 0) raw = 0;
+          if(raw > 2) raw = 2;
+          return raw;
+        }
+      }
+    }catch(e){}
+    return 0;
+  }
+  function onlyModeOn(){
+    return _currentReviewMode() >= 1;
   }
   function currentImgMode(){
     try{
@@ -5833,6 +6000,187 @@ def plot_after_merge(combined_df: pd.DataFrame,
       return params.get("img") || "";
     }catch(e){}
     return "";
+  }
+  function _inSkipMode(){
+    try{
+      var params = new URLSearchParams(window.location.search||"");
+      var img = params.get("img");
+      if(img && img.toLowerCase() === "skip"){
+        return true;
+      }
+    }catch(e){}
+    try{
+      if(document.documentElement && document.documentElement.getAttribute){
+        return document.documentElement.getAttribute("data-review-skip") === "1";
+      }
+    }catch(e){}
+    try{
+      return !!window.__REVIEW_SKIP_PENDING;
+    }catch(e){}
+    return false;
+  }
+  var BG_PLACEHOLDER_SRC = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+  function _bgImage(){
+    try{
+      return document.querySelector('.wrap img');
+    }catch(e){}
+    return null;
+  }
+  function _primeBackground(){
+    try{
+      var img = _bgImage();
+      if(!img) return null;
+      var actual = img.getAttribute('data-bg-src');
+      if(!actual){
+        var current = img.getAttribute('src');
+        if(current && current !== BG_PLACEHOLDER_SRC){
+          img.setAttribute('data-bg-src', current);
+          actual = current;
+        }
+      }
+      if(!actual){
+        return img;
+      }
+      if(!img.dataset){ img.dataset = {}; }
+      if(!img.dataset.bgPrimed){
+        img.dataset.bgPrimed = '1';
+        try{ img.loading = 'lazy'; }catch(_e){}
+        try{ img.decoding = 'async'; }catch(_e){}
+        if(img.getAttribute('src') === actual){
+          img.setAttribute('src', BG_PLACEHOLDER_SRC);
+        }
+        img.dataset.bgReady = '0';
+      } else if(img.getAttribute('src') === actual){
+        img.dataset.bgReady = '1';
+      }
+      return img;
+    }catch(e){}
+    return null;
+  }
+  function _ensureBackgroundLoaded(){
+    try{
+      var img = _primeBackground() || _bgImage();
+      if(!img) return false;
+      var src = img.getAttribute('data-bg-src');
+      if(!src){
+        return false;
+      }
+      if(img.getAttribute('src') === src){
+        if(img.dataset){ img.dataset.bgReady = '1'; }
+        return true;
+      }
+      img.setAttribute('src', src);
+      if(img.dataset){ img.dataset.bgReady = '1'; }
+      return true;
+    }catch(e){}
+    return false;
+  }
+  function _updateImgParams(mode){
+    try{
+      var params = new URLSearchParams(window.location.search||"");
+      if(mode === 'skip'){
+        params.set("img","skip");
+      } else if(mode === '1'){
+        params.set("img","1");
+      } else if(mode === null){
+        params.delete("img");
+      }
+      var review = _currentReviewMode();
+      if(review >= 1){
+        params.set("only","to_check");
+        params.set("review", String(review));
+      } else if(mode === '1'){
+        params.set("only","to_check");
+        params.set("review","1");
+      } else {
+        params.delete("only");
+        params.delete("review");
+      }
+      var prefix = _resolvePagePrefix();
+      if(!prefix) return;
+      var href = prefix + "_page" + PAGE_NUM + ".html";
+      var query = params.toString();
+      if(query){ href += "?" + query; }
+      var hash = (window.location.hash && window.location.hash.indexOf("#seek=") !== -1) ? window.location.hash : "";
+      if(window.history && window.history.replaceState){
+        window.history.replaceState(null, document.title, href + hash);
+      } else {
+        window.location.replace(href + hash);
+      }
+    }catch(e){}
+  }
+  function _markReviewSkip(flag){
+    try{
+      var v = !!flag;
+      window.__REVIEW_SKIP_PENDING = v;
+      var root = document.documentElement;
+      if(root && root.setAttribute){
+        if(v){
+          root.setAttribute("data-review-skip","1");
+        } else {
+          root.removeAttribute("data-review-skip");
+        }
+      }
+    }catch(e){}
+  }
+  function _autoStorageKey(){
+    try{
+      var base = window.PAGE_PREFIX || PAGE_PREFIX || PAGE_KEY;
+      if(base){ return "AUTO_ALADIN_" + base; }
+    }catch(e){}
+    return "AUTO_ALADIN_global";
+  }
+  function _setAutoStoredState(on){
+    try{
+      var key = _autoStorageKey();
+      localStorage.setItem(key, on ? "1" : "0");
+      localStorage.setItem("AUTO_ALADIN", on ? "1" : "0");
+    }catch(e){}
+  }
+  function _readAutoStoredState(){
+    try{
+      var key = _autoStorageKey();
+      var val = localStorage.getItem(key);
+      if(val === null){
+        val = localStorage.getItem("AUTO_ALADIN");
+      }
+      return val === "1";
+    }catch(e){
+      return false;
+    }
+  }
+  function _disableAutoAladinForSkip(){
+    try{
+      var cb = document.getElementById("auto_aladin");
+      var wasOn = false;
+      if(cb && cb.checked){
+        wasOn = true;
+      } else {
+        wasOn = _readAutoStoredState();
+      }
+      if(wasOn){
+        sessionStorage.setItem("AUTO_ALADIN_RESTORE_PENDING","1");
+      }
+      _setAutoStoredState(false);
+      if(cb){
+        cb.checked = false;
+      }
+      sessionStorage.setItem("AUTO_ALADIN_SUPPRESS","1");
+    }catch(e){}
+  }
+  function _maybeRestoreAutoAladinAfterSkip(){
+    try{
+      var pending = sessionStorage.getItem("AUTO_ALADIN_RESTORE_PENDING");
+      if(pending === "1"){
+        sessionStorage.removeItem("AUTO_ALADIN_RESTORE_PENDING");
+        _setAutoStoredState(true);
+        var cb = document.getElementById("auto_aladin");
+        if(cb){
+          cb.checked = true;
+        }
+        try{ sessionStorage.removeItem("AUTO_ALADIN_SUPPRESS"); }catch(_e){}
+      }
+    }catch(e){}
   }
   function pageHasProblem(){
     try{
@@ -5862,11 +6210,27 @@ def plot_after_merge(combined_df: pd.DataFrame,
     }catch(e){}
     return "";
   }
+  function _resolvePagePrefix(){
+    var key = _resolvePageKey();
+    if(key){ return key; }
+    try{
+      var p = String(window.location && window.location.pathname || '');
+      var match = p.match(/([^\\/]+)_page\\d+\\.html$/);
+      if(match && match[1]){ return match[1]; }
+    }catch(e){}
+    return "";
+  }
   function reloadWithBackground(){
     try{
       var params = new URLSearchParams(window.location.search||"");
+      var review = _currentReviewMode();
       params.set("img","1");
       params.set("only","to_check");
+      if(review >= 1){
+        params.set("review", String(review));
+      } else {
+        params.set("review","1");
+      }
       var prefix = _resolvePagePrefix();
       var href = prefix + "_page" + PAGE_NUM + ".html";
       var query = params.toString();
@@ -5877,26 +6241,67 @@ def plot_after_merge(combined_df: pd.DataFrame,
   }
   function skipCleanPage(){
     try{
+      _markReviewSkip(true);
       var dirHash = (window.location.hash && window.location.hash.indexOf("prev") !== -1) ? "prev" : "next";
       var target = dirHash === "prev" ? (PAGE_NUM - 1) : (PAGE_NUM + 1);
       if(target < 1 || target > TOTAL_PAGES) return false;
+      _disableAutoAladinForSkip();
+      try{
+        var auto = document.getElementById("auto_aladin");
+        if(auto && auto.checked){
+          sessionStorage.setItem("AUTO_ALADIN_SUPPRESS","1");
+        }
+      }catch(e){}
       _navToPage(target, dirHash, {img:"skip", replace:true});
       return true;
     }catch(e){}
     return false;
   }
+  var __initialSkipMode = _inSkipMode();
+  _markReviewSkip(__initialSkipMode);
+  if(__initialSkipMode){
+    _disableAutoAladinForSkip();
+  } else {
+    _maybeRestoreAutoAladinAfterSkip();
+  }
+  _primeBackground();
+  if(currentImgMode() === "1" || !onlyModeOn()){
+    _ensureBackgroundLoaded();
+  }
   document.addEventListener("DOMContentLoaded", function(){
     try{
-      if(!onlyModeOn()) return;
-      if(pageHasProblem()){
+      if(!onlyModeOn()){
+        _updateImgParams('1');
+        _markReviewSkip(false);
+        _ensureBackgroundLoaded();
+        _maybeRestoreAutoAladinAfterSkip();
+        try{ sessionStorage.removeItem("AUTO_ALADIN_SUPPRESS"); }catch(_e){}
+        return;
+      }
+      var needsReview = _hasUnskippedProblems();
+      if(needsReview){
+        try{ sessionStorage.removeItem("AUTO_ALADIN_SUPPRESS"); }catch(_e){}
         if(currentImgMode() !== "1"){
           reloadWithBackground();
+        } else {
+          _markReviewSkip(false);
+          _ensureBackgroundLoaded();
+          _updateImgParams('1');
+          _maybeRestoreAutoAladinAfterSkip();
         }
         return;
       }
+      _markReviewSkip(true);
       skipCleanPage();
     }catch(e){}
   }, true);
+  window.addEventListener("pageshow", function(){
+    try{
+      if(!_inSkipMode()){
+        _ensureBackgroundLoaded();
+      }
+    }catch(e){}
+  });
 })();
 </script>''')
             lines.append(f'<script src="nav_keys.js?v={NAV_KEYS_VERSION}"></script>')
