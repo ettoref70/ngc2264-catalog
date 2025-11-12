@@ -1718,7 +1718,27 @@ def attach_2mass_blends(combined_df: pd.DataFrame,
         if centroid_offset > centroid_eff:
             continue
 
-        # Brightness similarity (optional)
+        # Brightness similarity (optional with faint-member pruning)
+        while True:
+            gvals = gaia.iloc[idxs]['Gmag'].values
+            if (np.nanmax(gvals) - np.nanmin(gvals) <= dG_eff) or len(idxs) <= 2:
+                break
+            try:
+                faint_pos = int(np.nanargmax(gvals))
+            except (ValueError, TypeError):
+                break
+            idx_remove = idxs[faint_pos]
+            label_remove = int(idx_labels[faint_pos])
+            reduced = [idx for idx in idxs if idx != idx_remove]
+            if len(reduced) < 2:
+                break
+            ok_group_r, adjacency_r = _check_group(reduced)
+            if not ok_group_r:
+                break
+            idxs = reduced
+            idx_labels = gaia.index[idxs]
+            adjacency = adjacency_r
+            removed_labels.add(label_remove)
         gvals = gaia.iloc[idxs]['Gmag'].values
         if np.nanmax(gvals) - np.nanmin(gvals) > dG_eff:
             continue
@@ -5849,6 +5869,7 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 '<span><kbd>a</kbd> Aladin</span>'
                 '<span><kbd>g</kbd> goto</span>'
                 '<span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> toggle</span>'
+                '<span><kbd>d</kbd> delete</span>'
                 '</div>'
             )
             # JS helper to call local SAMP link server when available
@@ -5890,6 +5911,9 @@ def plot_after_merge(combined_df: pd.DataFrame,
                 '}\n'
                 '// Panel filtering and skip controls\n'
                 'function deleteSource(btn){ try{ const panel=btn.closest(".panelbox"); if(!panel) return false; const cat=panel.getAttribute("data-cat"); const other=panel.getAttribute("data-other"); if(!cat||!other) return false; if(!(window.confirm("Remove this source from the master catalog?"))){ return false; } btn.disabled=true; fetch("/api/delete_source",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cat:cat,id:other,page:PAGE_NUM})}).then(function(resp){ if(!resp.ok){ throw new Error(resp.status); } return resp.json().catch(function(){ return {ok:true}; }); }).then(function(payload){ if(payload && payload.ok){ location.reload(); } else { btn.disabled=false; alert((payload && payload.error) || "Delete failed."); } }).catch(function(err){ btn.disabled=false; alert("Delete failed: "+err); }); }catch(e){ alert("Delete failed."); } return false; }\n'
+                'function _isEditableTarget(el){ if(!el) return false; if(el.isContentEditable) return true; var tag = (el.tagName || "").toUpperCase(); return tag==="INPUT" || tag==="TEXTAREA" || tag==="SELECT"; }\n'
+                'function _panelForDeletion(){ try{ var hover = document.querySelector(".panelbox:hover"); if(hover) return hover; }catch(_e){} try{ return document.querySelector(".panelbox"); }catch(_e){} return null; }\n'
+                'function _deletePanelUnderCursor(){ try{ var panel=_panelForDeletion(); if(!panel) return false; var btn=panel.querySelector(".delbtn"); if(!btn) return false; btn.focus(); btn.click(); return true; }catch(_e){} return false; }\n'
                 'function _readSkip(){ try{ const k = "SKIP_"+PAGE_KEY; const s = localStorage.getItem(k); return s? JSON.parse(s) : {}; }catch(e){ return {}; } }\n'
                 'function _writeSkip(obj){ try{ const k = "SKIP_"+PAGE_KEY; localStorage.setItem(k, JSON.stringify(obj)); }catch(e){} }\n'
                 'function _clampReviewMode(v){ try{ v = parseInt(v,10); }catch(e){ v = 0; } if(isNaN(v) || v < 0) return 0; if(v > 2) return 2; return v; }\n'
@@ -6268,6 +6292,18 @@ def plot_after_merge(combined_df: pd.DataFrame,
   if(currentImgMode() === "1" || !onlyModeOn()){
     _ensureBackgroundLoaded();
   }
+  document.addEventListener("keydown", function(evt){
+    try{
+      if(_isEditableTarget(evt.target)) return;
+      if(evt.ctrlKey || evt.metaKey || evt.altKey) return;
+      var key = String(evt.key||"").toLowerCase();
+      if(key === "d"){
+        if(_deletePanelUnderCursor()){
+          evt.preventDefault();
+        }
+      }
+    }catch(_e){}
+  }, true);
   document.addEventListener("DOMContentLoaded", function(){
     try{
       if(!onlyModeOn()){
